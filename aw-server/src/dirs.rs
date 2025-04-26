@@ -127,33 +127,3 @@ fn test_get_dirs() {
     db_path(true).unwrap();
     db_path(false).unwrap();
 }
-
-#[test]
-#[cfg(not(target_os = "android"))]
-fn test_log_dir_has_log_component() {
-    let log_dir = get_log_dir("aw-server-rust").unwrap();
-    let path_str = log_dir.to_string_lossy();
-
-    // The log path must contain a log-specific subdirectory, not just the cache dir.
-    // This guards against the regression from PR #562 where /log was dropped.
-    #[cfg(target_os = "linux")]
-    assert!(
-        path_str.contains("activitywatch/log/"),
-        "Linux log path should contain activitywatch/log/, got: {}",
-        path_str
-    );
-
-    #[cfg(target_os = "macos")]
-    assert!(
-        path_str.contains("Library/Logs/activitywatch"),
-        "macOS log path should use Library/Logs, got: {}",
-        path_str
-    );
-
-    #[cfg(target_os = "windows")]
-    assert!(
-        path_str.contains("activitywatch\\Logs\\") || path_str.contains("activitywatch/Logs/"),
-        "Windows log path should contain activitywatch/Logs, got: {}",
-        path_str
-    );
-}

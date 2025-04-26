@@ -3,6 +3,7 @@
 # Depended on by aw-android/scripts/setup-rust-with-ndk.sh
 set -x;
 set -e;
+set -x;
 
 NDK_VERSION=r25c
 
@@ -17,8 +18,11 @@ if [ -z "$ANDROID_NDK_HOME" ]; then
     else
         echo 'ANDROID_NDK_HOME not set, downloading NDK...';
         # Download Linux NDK or macOS NDK, depending on OS
-        wget --no-verbose -O android-ndk.zip https://dl.google.com/android/repository/android-ndk-$NDK_VERSION-$platform.zip;
-        unzip -q -d NDK android-ndk.zip;
+        #wget --no-verbose -O android-ndk.zip https://dl.google.com/android/repository/android-ndk-$NDK_VERSION-$platform.zip;
+        rm -f android-ndk.zip && curl --proxy socks5h://172.17.48.1:10808 -L -C - --http1.1 -o android-ndk.zip https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+	#wget -O android-ndk.zip https://dl.google.com/android/repository/android-ndk-$NDK_VERSION-$platform.zip
+	#wget --no-verbose -O android-ndk.zip https://mirrors.tuna.tsinghua.edu.cn/android/repository/android-ndk-$NDK_VERSION-$platform.zip
+	unzip -q -d NDK android-ndk.zip;
         ls NDK;
         mv NDK/*/* NDK/;
     fi
