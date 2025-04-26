@@ -1,7 +1,7 @@
 #!/bin/bash
 # Based on https://mozilla.github.io/firefox-browser-architecture/experiments/2017-09-21-rust-on-android.html
 # Depended on by aw-android/scripts/setup-rust-with-ndk.sh
-
+set -x;
 set -e;
 
 NDK_VERSION=r25c

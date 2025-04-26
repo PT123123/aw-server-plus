@@ -3,8 +3,9 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use gethostname::gethostname;
+use rocket::fairing::Fairing;
 use rocket::fs::FileServer;
-use rocket::http::ContentType;
+use rocket::http::{ContentType, Header};
 use rocket::serde::json::Json;
 use rocket::State;
 
@@ -60,6 +61,26 @@ mod query;
 mod settings;
 
 pub use util::HttpErrorJson;
+
+// CSP Fairing
+pub struct CSPFairing;
+
+#[rocket::async_trait]
+impl Fairing for CSPFairing {
+    fn info(&self) -> rocket::fairing::Info {
+        rocket::fairing::Info {
+            name: "Content Security Policy",
+            kind: rocket::fairing::Kind::Response,
+        }
+    }
+
+    async fn on_response<'r>(&self, _request: &'r rocket::Request<'_>, response: &mut rocket::Response<'r>) {
+        response.set_header(Header::new(
+            "Content-Security-Policy",
+            "default-src 'self'; connect-src 'self' http://localhost:5600 http://localhost:5601 ws://localhost:5600 ws://localhost:5601 http://127.0.0.1:5600 http://127.0.0.1:5601; script-src 'self' 'unsafe-eval'; img-src 'self' blob: data: http://127.0.0.1:5600; style-src 'self' 'unsafe-inline'; font-src 'self'; frame-src 'self'; manifest-src 'self'; upgrade-insecure-requests; block-all-mixed-content;",
+        ));
+    }
+}
 
 #[get("/")]
 fn root_index(state: &State<ServerState>) -> Option<(ContentType, Vec<u8>)> {
@@ -149,7 +170,7 @@ pub fn build_rocket(server_state: ServerState, config: AWConfig) -> rocket::Rock
         // request is rewritten to the 403 route before they inspect the path.
         .attach(extension_cors)
         .attach(hostcheck)
-        .attach(apikey)
+        .attach(CSPFairing) // 添加 CSP Fairing here
         .manage(cors)
         .manage(server_state)
         .manage(config)

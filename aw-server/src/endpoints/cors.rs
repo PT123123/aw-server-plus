@@ -9,6 +9,17 @@ pub fn cors(config: &AWConfig) -> rocket_cors::Cors {
     let mut allowed_exact_origins = vec![root_url, root_url_localhost];
     allowed_exact_origins.extend(config.cors.clone());
 
+    // 添加对 5600 和 5601 端口的允许 (HTTP 和 WebSocket)
+    allowed_exact_origins.push("http://localhost:5600".to_string());
+    allowed_exact_origins.push("http://localhost:5601".to_string());
+    allowed_exact_origins.push("http://127.0.0.1:5600".to_string());
+    allowed_exact_origins.push("http://127.0.0.1:5601".to_string());
+
+    // 如果你的前端通过 WebSocket 连接到这些端口，你可能还需要添加到 allowed_origins
+    // 但 AllowedOrigins::some 主要处理 HTTP(S)
+    // 对于 WebSocket，浏览器通常不会发送 Origin 头进行预检
+    // 你可能需要在你的后端 WebSocket 处理逻辑中进行额外的来源验证
+
     if config.testing {
         allowed_exact_origins.push("http://127.0.0.1:27180".to_string());
         allowed_exact_origins.push("http://localhost:27180".to_string());
