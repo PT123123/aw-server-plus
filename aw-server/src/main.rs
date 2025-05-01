@@ -8,6 +8,7 @@ use clap::crate_version;
 use clap::Parser;
 
 use aw_server::*;
+mod plugins;
 
 #[cfg(target_os = "linux")]
 use sd_notify::NotifyState;
@@ -191,9 +192,19 @@ async fn main() -> Result<(), rocket::Error> {
         device_id,
     };
 
-    let _rocket = endpoints::build_rocket(server_state, config)
-        .ignite()
-        .await?;
+    let rocket = endpoints::build_rocket(server_state, config);
+
+    // 初始化 aw-inbox-rust 的数据库连接池并注入
+    use aw_inbox_rust::db;
+    use aw_inbox_rust::SharedDb;
+    use std::sync::Arc;
+    use tokio::sync::Mutex as TokioMutex;
+    let pool = db::init_pool().await.expect("Failed to init inbox db pool");
+    db::migrate(&pool).await.expect("数据库迁移失败");
+    let shared_db: SharedDb = Arc::new(TokioMutex::new(pool));
+    let rocket = plugins::register_all_plugins(rocket, shared_db);
+
+    let _rocket = rocket.ignite().await?;
     #[cfg(target_os = "linux")]
     let _ = sd_notify::notify(true, &[NotifyState::Ready]);
     _rocket.launch().await?;

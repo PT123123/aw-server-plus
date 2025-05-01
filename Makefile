@@ -23,6 +23,29 @@ endif
 aw-server: set-version aw-webui
 	cargo build $(cargoflag) --bin aw-server
 
+run: aw-server
+	@fuser -k 5600/tcp 2>/dev/null || true
+	./target/$(targetdir)/aw-server
+
+ui-test:
+	@fuser -k 5600/tcp 2>/dev/null || true
+	if ! lsof -i:5600 | grep LISTEN > /dev/null; then \
+	  echo "[ui-test] Starting aw-server in background (port 5600)..."; \
+	  cargo build $(cargoflag) --bin aw-server; \
+	  nohup ./target/$(targetdir)/aw-server > aw-server.log 2>&1 & \
+	  sleep 5; \
+	fi
+	@if [ ! -d aw-webui/node_modules ]; then \
+	  echo "[ui-test] Installing npm dependencies..."; \
+	  cd aw-webui && npm install; \
+	fi
+	@if ! lsof -i:27180 | grep LISTEN > /dev/null; then \
+	  echo "[ui-test] Starting aw-webui dev server in background (port 27180)..."; \
+	  cd aw-webui && nohup npm run serve > ../webui-serve.log 2>&1 & \
+	  sleep 10; \
+	fi
+	cd aw-webui && npx cypress run
+
 aw-sync: set-version
 	cargo build $(cargoflag) --bin aw-sync
 
@@ -36,6 +59,23 @@ endif
 android:
 	./install-ndk.sh
 	./compile-android.sh
+
+.PHONY: inbox-test
+inbox-test:
+	@fuser -k 5600/tcp 2>/dev/null || true
+	if ! lsof -i:5600 | grep LISTEN > /dev/null; then \
+	  echo "[inbox-test] Starting inbox service in background (port 5600)..."; \
+	  make build; \
+	  # [已禁用] nohup env ROCKET_CONFIG=aw-inbox-rust/Rocket.toml ./target/$(targetdir)/aw-inbox-rust > inbox.log 2>&1 & \
+	  sleep 10; \
+	fi
+	@echo "[inbox-test] # [已禁用] Testing connectivity to http://localhost:5600 ..."
+	@# [已禁用] if curl -sSf http://localhost:5600/inbox > /dev/null; then \
+	  echo "[inbox-test] SUCCESS: Inbox service is reachable on port 5600."; \
+	else \
+	  echo "[inbox-test] ERROR: Inbox service is NOT reachable on port 5600."; \
+	  exit 1; \
+	fi
 
 test:
 	cargo test
@@ -108,3 +148,6 @@ install:
 
 clean:
 	cargo clean
+
+build:
+	RUSTFLAGS="-A unused_variables -A dead_code" cargo build --release

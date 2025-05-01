@@ -45,6 +45,8 @@ aw-datastore = { path = "../aw-datastore", default-features = false }
 aw-models = { path = "../aw-models" }
 aw-transform = { path = "../aw-transform" }
 aw-query = { path = "../aw-query" }
+aw-inbox-rust = { path = "../aw-inbox-rust" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [target.'cfg(target_os="linux")'.dependencies]
 sd-notify = "0.4.2"
