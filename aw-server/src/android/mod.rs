@@ -14,15 +14,37 @@ use rocket::serde::json::json;
 
 #[no_mangle]
 pub extern "C" fn rust_greeting(to: *const c_char) -> *mut c_char {
-    let c_str = unsafe { CStr::from_ptr(to) };
-    let recipient = match c_str.to_str() {
-        Err(_) => "there",
-        Ok(string) => string,
-    };
+    // 检查输入指针是否为空
+    if to.is_null() {
+        error!("rust_greeting 收到空指针");
+        return std::ptr::null_mut();
+    }
+    
+    // 使用std::panic::catch_unwind捕获可能的panic
+    match std::panic::catch_unwind(|| {
+        let c_str = unsafe { CStr::from_ptr(to) };
+        let recipient = match c_str.to_str() {
+            Err(e) => {
+                error!("无法将C字符串转换为Rust字符串: {:?}", e);
+                "there"
+            },
+            Ok(string) => string,
+        };
 
-    CString::new("Hello ".to_owned() + recipient + " (from Rust!)")
-        .unwrap()
-        .into_raw()
+        match CString::new("Hello ".to_owned() + recipient + " (from Rust!)") {
+            Ok(result) => result.into_raw(),
+            Err(e) => {
+                error!("无法创建CString: {:?}", e);
+                std::ptr::null_mut()
+            }
+        }
+    }) {
+        Ok(result) => result,
+        Err(e) => {
+            error!("rust_greeting处理时发生panic: {:?}", e);
+            std::ptr::null_mut()
+        }
+    }
 }
 
 #[cfg(target_os = "android")]
@@ -30,7 +52,7 @@ pub extern "C" fn rust_greeting(to: *const c_char) -> *mut c_char {
 pub mod android {
     extern crate jni;
 
-    use self::jni::objects::{JClass, JString};
+    use self::jni::objects::{JClass, JString, JObject};
     use self::jni::sys::{jdouble, jint, jstring};
     use self::jni::JNIEnv;
     use super::*;
@@ -79,74 +101,266 @@ pub mod android {
         _: JClass,
         java_pattern: JString,
     ) -> jstring {
-        debug!("开始从 Java 环境获取传入的字符串...");
-        // Our Java companion code might pass-in "world" as a string, hence the name.
-        let world = rust_greeting(
+        debug!("[修改版本3] greeting 开始执行...");
+        
+        // 检查 java_pattern 是否为空
+        if java_pattern.is_null() {
+            error!("[修改版本3] 错误: 传入的 java_pattern 为空指针");
+            return std::ptr::null_mut();
+        }
+        
+        // 使用catch_unwind捕获可能的panic
+        let is_null_object = match std::panic::catch_unwind(|| {
+            env.is_same_object(java_pattern, JObject::null())
+        }) {
+            Ok(result) => match result {
+                Ok(is_null) => is_null,
+                Err(e) => {
+                    error!("[修改版本3] 错误: is_same_object调用失败: {:?}", e);
+                    false // 假设不是null对象，继续处理
+                }
+            },
+            Err(e) => {
+                error!("[修改版本3] 错误: is_same_object调用时发生panic: {:?}", e);
+                return std::ptr::null_mut(); // 发生panic，返回null
+            }
+        };
+        
+        if is_null_object {
+            error!("[修改版本3] 错误: 传入的 java_pattern 是null对象");
+            return std::ptr::null_mut();
+        }
+        
+        // 安全地获取字符串
+        let java_str = match std::panic::catch_unwind(|| {
             env.get_string(java_pattern)
-                .expect("invalid pattern string")
-                .as_ptr(),
-        );
-        debug!("成功调用 rust_greeting 函数，开始重新获取指针...");
-        // Retake pointer so that we can use it below and allow memory to be freed when it goes out of scope.
-        let world_ptr = CString::from_raw(world);
-        debug!("开始将结果转换为 Java 字符串...");
-        let output = env
-            .new_string(world_ptr.to_str().unwrap())
-            .expect("Couldn't create java string!");
-        debug!("成功转换为 Java 字符串，返回结果...");
-        output.into_raw()
+        }) {
+            Ok(get_string_result) => match get_string_result {
+                Ok(s) => {
+                    debug!("[修改版本3] 成功获取 Java 字符串");
+                    s
+                },
+                Err(e) => {
+                    error!("[修改版本3] 错误: 无法从 JNI 获取字符串: {:?}", e);
+                    return std::ptr::null_mut();
+                }
+            },
+            Err(e) => {
+                error!("[修改版本3] 错误: get_string调用时发生panic: {:?}", e);
+                return std::ptr::null_mut(); // 发生panic，返回null
+            }
+        };
+        
+        // 调用 rust_greeting，使用catch_unwind捕获可能的panic
+        let world = match std::panic::catch_unwind(|| {
+            rust_greeting(java_str.as_ptr())
+        }) {
+            Ok(ptr) => {
+                debug!("[修改版本3] rust_greeting 返回指针: {:p}", ptr as *const ());
+                ptr
+            },
+            Err(e) => {
+                error!("[修改版本3] 错误: rust_greeting调用时发生panic: {:?}", e);
+                return std::ptr::null_mut(); // 发生panic，返回null
+            }
+        };
+        
+        // 检查返回的指针是否为空
+        if world.is_null() {
+            error!("[修改版本3] 错误: rust_greeting 返回了空指针");
+            return std::ptr::null_mut();
+        }
+        
+        // 重新获取指针，使用catch_unwind捕获可能的panic
+        let world_str = match std::panic::catch_unwind(|| {
+            let ptr = CString::from_raw(world);
+            let result = match ptr.to_str() {
+                Ok(s) => {
+                    debug!("[修改版本3] 成功转换为 Rust 字符串: {}", s);
+                    Ok(s.to_string())
+                },
+                Err(e) => {
+                    error!("[修改版本3] 错误: 无法转换为 Rust 字符串: {:?}", e);
+                    Err(e)
+                }
+            };
+            // 这里不需要保存ptr，因为它会在作用域结束时自动释放
+            result
+        }) {
+            Ok(Ok(str)) => str,
+            Ok(Err(_)) | Err(_) => {
+                error!("[修改版本3] 错误: CString处理时发生错误");
+                return std::ptr::null_mut();
+            }
+        };
+        
+        // 转换为 Java 字符串，使用string_to_jstring函数
+        debug!("[修改版本3] 步骤4: 将结果转换为 Java 字符串");
+        let result = string_to_jstring(&env, world_str);
+        
+        debug!("[修改版本3] greeting 执行完成");
+        result
     }
 
     unsafe fn jstring_to_string(env: &JNIEnv, string: JString) -> String {
-        debug!("开始将 Java 字符串转换为 Rust 字符串...");
-
-        // 1. 获取 JNIString 并将其绑定到变量，以延长其生命周期
-        let java_string = env.get_string(string).expect("无法从 JNI 获取字符串");
-
-        // 2. 从有效的 JNIString 获取 C 指针
-        let raw_c_str = java_string.as_ptr();
-
-        // 3. 从有效的指针创建 CStr
-        let c_str = CStr::from_ptr(raw_c_str);
-
-        debug!("成功获取 C 字符串: {:?}，开始转换为 Rust 字符串...", c_str);
-
-        // 4. 尝试转换为 Rust &str，并处理可能的错误，避免使用 unwrap()
-        let result_str_slice = match c_str.to_str() {
-            Ok(s) => s,
+        debug!("[修改版本3] jstring_to_string 开始执行...");
+        
+        // 检查 JString 是否为空
+        if string.is_null() {
+            error!("[修改版本3] 错误: 传入的 JString 为空指针");
+            return String::from("");
+        }
+        
+        // 使用catch_unwind捕获可能的panic
+        let is_null_object = match std::panic::catch_unwind(|| {
+            env.is_same_object(string, JObject::null())
+        }) {
+            Ok(result) => match result {
+                Ok(is_null) => is_null,
+                Err(e) => {
+                    error!("[修改版本3] 错误: is_same_object调用失败: {:?}", e);
+                    false // 假设不是null对象，继续处理
+                }
+            },
             Err(e) => {
-                // 记录详细错误，而不是直接 panic
-                error!("无法将 C 字符串 {:?} 转换为有效的 UTF-8 字符串: {}", c_str, e);
-                // 这里可以选择 panic 或返回一个错误标记字符串
-                // 为了调试，我们暂时 panic，但在生产代码中可能需要更优雅的处理
-                panic!("JNI 字符串包含无效的 UTF-8 序列");
-                // 或者返回错误标记: return String::from("Error: Invalid UTF-8");
+                error!("[修改版本3] 错误: is_same_object调用时发生panic: {:?}", e);
+                return String::from(""); // 发生panic，返回空字符串
             }
         };
-
-        // 5. 从有效的 &str 创建拥有的 String
-        let result = String::from(result_str_slice);
-
-        // java_string 会在此处离开作用域并被安全地清理，其管理的指针 raw_c_str 也随之失效
-
-        debug!("Java 字符串成功转换为 Rust 字符串: {}", result); // 打印最终结果
+        
+        if is_null_object {
+            error!("[修改版本3] 错误: 传入的 JString 是 null 对象");
+            return String::from("");
+        }
+        
+        // 安全地获取字符串，使用catch_unwind捕获可能的panic
+        let java_str = match std::panic::catch_unwind(|| {
+            env.get_string(string)
+        }) {
+            Ok(get_string_result) => match get_string_result {
+                Ok(s) => {
+                    debug!("[修改版本3] 成功获取 JString 内容");
+                    s
+                },
+                Err(e) => {
+                    error!("[修改版本3] 错误: 无法从 JNI 获取字符串: {:?}", e);
+                    return String::from("");
+                }
+            },
+            Err(e) => {
+                error!("[修改版本3] 错误: get_string调用时发生panic: {:?}", e);
+                return String::from(""); // 发生panic，返回空字符串
+            }
+        };
+        
+        // 使用catch_unwind捕获可能的panic
+        let result = match std::panic::catch_unwind(|| {
+            let result = java_str.to_string_lossy().into_owned();
+            if result.is_empty() {
+                debug!("[修改版本3] 转换后的 Rust 字符串为空");
+                String::from("")
+            } else {
+                debug!("[修改版本3] Java 字符串成功转换为 Rust 字符串: {}", result);
+                result
+            }
+        }) {
+            Ok(result) => {
+                debug!("[修改版本3] jstring_to_string 执行完成，返回结果");
+                result
+            },
+            Err(e) => {
+                error!("[修改版本3] 错误: to_string_lossy调用时发生panic: {:?}", e);
+                String::from("") // 发生panic，返回空字符串
+            }
+        };
         result
     }
 
     unsafe fn string_to_jstring(env: &JNIEnv, string: String) -> jstring {
-        debug!("开始将 Rust 字符串转换为 Java 字符串...");
-        let result = env.new_string(string)
-            .expect("Couldn't create java string")
-            .into_raw();
-        debug!("Rust 字符串成功转换为 Java 字符串...");
+        debug!("[修改版本3] string_to_jstring 开始执行...");
+        debug!("[修改版本3] 输入字符串长度: {}", string.len());
+        
+        debug!("[修改版本3] 步骤1: 检查输入字符串是否为空");
+        if string.is_empty() {
+            error!("[修改版本3] 警告: 输入的字符串为空");
+            // 返回空字符串而不是null指针
+            let empty_str = "";
+            let new_empty_result = env.new_string(empty_str);
+            match new_empty_result {
+                Ok(jstring_obj) => {
+                    let result = jstring_obj.into_raw();
+                    debug!("[修改版本3] 返回空字符串，指针值: {:p}", result as *const ());
+                    return result;
+                },
+                Err(e) => {
+                    error!("[修改版本3] 错误: 无法创建空Java字符串: {:?}", e);
+                    // 如果连空字符串都无法创建，返回null但不终止程序
+                    return std::ptr::null_mut();
+                }
+            }
+        }
+        
+        debug!("[修改版本3] 步骤2: 调用 env.new_string 创建 Java 字符串");
+        // 使用try_catch块捕获可能的JNI异常
+        let new_string_result = match std::panic::catch_unwind(|| {
+            env.new_string(string)
+        }) {
+            Ok(result) => result,
+            Err(e) => {
+                error!("[修改版本3] 严重错误: new_string调用时发生panic: {:?}", e);
+                return std::ptr::null_mut();
+            }
+        };
+        
+        match &new_string_result {
+            Ok(_) => debug!("[修改版本3] new_string 成功"),
+            Err(e) => debug!("[修改版本3] new_string 失败: {:?}", e),
+        }
+        
+        let result = match new_string_result {
+            Ok(jstring_obj) => {
+                debug!("[修改版本3] 成功创建 Java 字符串对象");
+                debug!("[修改版本3] 步骤3: 调用 into_raw 转换为原始指针");
+                // 确保正确转换为 jstring 类型
+                let raw_result = jstring_obj.into_raw();
+                debug!("[修改版本3] into_raw 完成，指针值: {:p}", raw_result as *const ());
+                raw_result
+            },
+            Err(e) => {
+                error!("[修改版本3] 错误: 无法创建 Java 字符串: {:?}", e);
+                // 返回 null 指针
+                std::ptr::null_mut()
+            }
+        };
+        
+        debug!("[修改版本3] string_to_jstring 执行完成，返回结果");
         result
     }
 
     unsafe fn create_error_object(env: &JNIEnv, msg: String) -> jstring {
-        debug!("开始创建错误对象...");
-        let obj = json!({ "error": &msg });
-        debug!("错误对象 JSON 构建完成，开始转换为 Java 字符串...");
-        string_to_jstring(&env, obj.to_string())
+        debug!("[修改版本3] create_error_object 开始执行...");
+        debug!("[修改版本3] 错误信息: {}", msg);
+        
+        // 使用catch_unwind捕获可能的panic
+        match std::panic::catch_unwind(|| {
+            debug!("[修改版本3] 步骤1: 创建 JSON 错误对象");
+            let obj = json!({ "error": &msg });
+            let json_str = obj.to_string();
+            debug!("[修改版本3] 错误对象 JSON: {}", json_str);
+            
+            debug!("[修改版本3] 步骤2: 将 JSON 字符串转换为 Java 字符串");
+            string_to_jstring(&env, json_str)
+        }) {
+            Ok(result) => {
+                debug!("[修改版本3] create_error_object 执行完成，返回结果");
+                result
+            },
+            Err(e) => {
+                error!("[修改版本3] 错误: create_error_object 处理时发生panic: {:?}", e);
+                // 返回null指针
+                std::ptr::null_mut()
+            }
+        }
     }
 
     #[no_mangle]
@@ -208,29 +422,44 @@ unsafe {
         env: JNIEnv,
         _: JClass,
     ) {
-        debug!("开始检查 aw-server-rust 是否已经初始化...");
+        debug!("[修改版本3] initialize 开始执行...");
+        debug!("[修改版本3] 步骤1: 检查 aw-server-rust 是否已经初始化");
+        
+        // 首先初始化日志记录器，确保后续日志能够正常输出
         if !INITIALIZED {
-            debug!("aw-server-rust 尚未初始化，开始初始化日志记录器...");
-            android_logger::init_once(
-                Config::default()
-                    .with_max_level(log::LevelFilter::Trace) // limit log level
-                    .with_tag("aw-server-rust"), // logs will show under mytag tag
-                                                 //.with_filter( // configure messages for specific crate
-                                                 //    FilterBuilder::new()
-                                                 //        .parse("debug,hello::crate=error")
-                                                 //        .build())
-            );
-            debug!("aw-server-rust 日志记录器初始化完成");
+            debug!("[修改版本3] aw-server-rust 尚未初始化，开始初始化日志记录器...");
+            debug!("[修改版本3] 步骤2: 调用 android_logger::init_once 初始化日志记录器");
+            
+            // 使用catch_unwind捕获可能的panic
+            match std::panic::catch_unwind(|| {
+                android_logger::init_once(
+                    Config::default()
+                        .with_max_level(log::LevelFilter::Trace)
+                        .with_tag("aw-server-rust")
+                )
+            }) {
+                Ok(init_result) => {
+                    debug!("[修改版本3] 日志记录器初始化结果: {:?}", init_result);
+                    debug!("[修改版本3] aw-server-rust 日志记录器初始化完成");
+                },
+                Err(e) => {
+                    // 如果初始化失败，尝试使用标准输出记录错误
+                    eprintln!("[修改版本3] 错误: 日志记录器初始化时发生panic: {:?}", e);
+                    // 继续执行，不要因为日志初始化失败而中断整个流程
+                }
+            }
         } else {
-            info!("aw-server-rust 已经初始化");
-            debug!("aw-server-rust 初始化检查完成，状态：已初始化");
+            info!("[修改版本3] aw-server-rust 已经初始化");
+            debug!("[修改版本3] aw-server-rust 初始化检查完成，状态：已初始化");
         }
+        
+        debug!("[修改版本3] 步骤3: 设置 INITIALIZED 标志为 true");
         INITIALIZED = true;
-        debug!("标记 aw-server-rust 为已初始化状态");
-        // Without this it might not work due to weird error probably arising from Rust optimizing away the JNIEnv:
-        //  JNI DETECTED ERROR IN APPLICATION: use of deleted weak global reference
-        string_to_jstring(&env, "test".to_string());
-        debug!("字符串转换操作完成");
+        debug!("[修改版本3] 标记 aw-server-rust 为已初始化状态");
+        
+        // 不再调用string_to_jstring，避免不必要的JNI调用
+        // 而是直接返回，简化初始化流程
+        debug!("[修改版本3] initialize 执行完成");
     }
 
     #[no_mangle]
@@ -239,31 +468,106 @@ unsafe {
         _: JClass,
         java_dir: JString,
     ) {
+        debug!("[修改版本3] setDataDir 开始执行...");
+        
+        // 确保日志记录器已初始化
         if !INITIALIZED {
-            debug!("aw-server-rust 尚未初始化，开始初始化日志记录器...");
-            android_logger::init_once(
-                Config::default()
-                    .with_max_level(log::LevelFilter::Trace) // limit log level
-                    .with_tag("aw-server-rust"), // logs will show under mytag tag
-                                                 //.with_filter( // configure messages for specific crate
-                                                 //    FilterBuilder::new()
-                                                 //        .parse("debug,hello::crate=error")
-                                                 //        .build())
-            );
-            debug!("aw-server-rust 日志记录器初始化完成");
+            debug!("[修改版本3] aw-server-rust 尚未初始化，开始初始化日志记录器...");
+            
+            // 使用catch_unwind捕获可能的panic
+            match std::panic::catch_unwind(|| {
+                android_logger::init_once(
+                    Config::default()
+                        .with_max_level(log::LevelFilter::Trace)
+                        .with_tag("aw-server-rust")
+                )
+            }) {
+                Ok(init_result) => {
+                    debug!("[修改版本3] 日志记录器初始化结果: {:?}", init_result);
+                    debug!("[修改版本3] aw-server-rust 日志记录器初始化完成");
+                },
+                Err(e) => {
+                    // 如果初始化失败，尝试使用标准输出记录错误
+                    eprintln!("[修改版本3] 错误: 日志记录器初始化时发生panic: {:?}", e);
+                    // 继续执行，不要因为日志初始化失败而中断整个流程
+                }
+            }
+            
+            INITIALIZED = true;
+            debug!("[修改版本3] 标记 aw-server-rust 为已初始化状态");
+        } else {
+            debug!("[修改版本3] aw-server-rust 已经初始化，跳过初始化步骤");
         }
 
-        error!("ee开始获取 Android 数据目录路径...");
-        debug!("setDataDir - JNIEnv 指针: {:?}", &env as *const _);
-        //debug!("setDataDir - java_dir (转换为 Rust String): {}", java_dir);
-        //debug!("setDataDir - java_dir JNI 引用地址: {:p}", java_dir);
-        info!("开始获取 Android 数据目录路径...");
-        // 对应/data/user/0/net.activitywatch.android.debug/files
-        let path = &jstring_to_string(&env, java_dir); //TODO-这个出错了
-        info!("成功获取 Android 数据目录路径: {}", path);
-        debug!("开始设置 Android 数据目录...");
-        dirs::set_android_data_dir(path);
-        info!("Android 数据目录设置完成");
+        info!("[修改版本3] 开始获取 Android 数据目录路径...");
+        
+        // 检查 java_dir 是否为空
+        if java_dir.is_null() {
+            error!("[修改版本3] 错误: 传入的 java_dir 为空指针，无法设置数据目录");
+            return;
+        }
+        
+        // 使用catch_unwind捕获可能的panic
+        let is_null_object = match std::panic::catch_unwind(|| {
+            env.is_same_object(java_dir, JObject::null())
+        }) {
+            Ok(result) => match result {
+                Ok(is_null) => is_null,
+                Err(e) => {
+                    error!("[修改版本3] 错误: is_same_object调用失败: {:?}", e);
+                    false // 假设不是null对象，继续处理
+                }
+            },
+            Err(e) => {
+                error!("[修改版本3] 错误: is_same_object调用时发生panic: {:?}", e);
+                false // 假设不是null对象，继续处理
+            }
+        };
+        
+        if is_null_object {
+            error!("[修改版本3] 错误: 传入的 java_dir 是null对象，无法设置数据目录");
+            return;
+        }
+        
+        // 安全地获取路径字符串
+        let path = match std::panic::catch_unwind(|| {
+            jstring_to_string(&env, java_dir)
+        }) {
+            Ok(path_str) => path_str,
+            Err(e) => {
+                error!("[修改版本3] 错误: jstring_to_string调用时发生panic: {:?}", e);
+                return; // 无法获取路径，直接返回
+            }
+        };
+        
+        if path.is_empty() {
+            error!("[修改版本3] 错误: 获取到的数据目录路径为空，无法设置数据目录");
+            return;
+        }
+        
+        info!("[修改版本3] 成功获取 Android 数据目录路径: {}", path);
+        
+        // 检查路径是否有效
+        if path.contains("\0") {
+            error!("[修改版本3] 错误: 路径包含空字符(\0)，这可能导致问题");
+            // 继续执行，但记录警告
+        }
+        
+        // 设置数据目录
+        match std::panic::catch_unwind(|| {
+            dirs::set_android_data_dir(&path);
+        }) {
+            Ok(_) => {
+                debug!("[修改版本3] dirs::set_android_data_dir 调用成功");
+            },
+            Err(e) => {
+                error!("[修改版本3] 错误: dirs::set_android_data_dir 调用时发生 panic: {:?}", e);
+                // 即使发生 panic 也继续执行，不要中断流程
+            }
+        }
+        
+        info!("[修改版本3] Android 数据目录设置完成");
+        debug!("[修改版本3] setDataDir 执行完成");
     }
 
     #[no_mangle]
