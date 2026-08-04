@@ -8,6 +8,7 @@ SCRIPT_DIR="$(
 )"
 cd "$SCRIPT_DIR"
 
+set -x
 platform="$(uname -s | tr '[:upper:]' '[:lower:]')"
 
 # if args, use them to select targets (x86_64, arm64, etc)
@@ -78,6 +79,9 @@ for archtargetstr in \
 
     echo "Building for $arch..."
 
+    export RUSTUP_DIST_SERVER=https://rsproxy.cn
+    export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+    export CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
     export PATH="$NDK_ARCH_DIR:$ORIG_PATH"
     export RUSTFLAGS="$ORIG_RUSTFLAGS"
     # Need to set AR for target since NDK 21+:
@@ -112,6 +116,7 @@ for archtargetstr in \
 
     # Build aw-server
     echo "Building aw-server for $arch..."
+    export CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse && export CARGO_SOURCE_CRATES_IO_REPLACE_WITH=ustc && export CARGO_SOURCE_USTC_REGISTRY="git://mirrors.ustc.edu.cn/crates.io-index"
     cargo build -p aw-server --target "$target" --lib "${release_args[@]}"
 
     # Build aw-sync (without cli feature for Android)

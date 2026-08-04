@@ -58,6 +58,9 @@ endif
 
 android:
 	./install-ndk.sh
+	export RUSTUP_DIST_SERVER=https://rsproxy.cn
+	export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+	export CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 	./compile-android.sh
 
 .PHONY: inbox-test
