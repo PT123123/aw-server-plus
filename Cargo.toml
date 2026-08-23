@@ -10,3 +10,15 @@ members = [
     "aw-query",
 ]
 resolver = "2"
+
+# 正确名称：dev 对应 cargo build 默认调试构建
+[profile.dev]
+opt-level = 0
+debug = true
+debug-assertions = true
+panic = "unwind"
+
+# 发布包调试备选（可选保留）
+[profile.release]
+debug = true
+panic = "unwind"

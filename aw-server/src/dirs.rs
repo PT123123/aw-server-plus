@@ -44,11 +44,11 @@ pub fn get_data_dir() -> Result<PathBuf, ()> {
 #[cfg(target_os = "android")]
 pub fn get_data_dir() -> Result<PathBuf, ()> {
     debug!("[修改版本2] get_data_dir 开始执行");
-    
+
     // 尝试获取锁，并处理可能的错误
     debug!("[修改版本2] 尝试获取 ANDROID_DATA_DIR 锁");
     let lock_result = ANDROID_DATA_DIR.lock();
-    
+
     match lock_result {
         Ok(android_data_dir) => {
             debug!("[修改版本2] 成功获取 ANDROID_DATA_DIR 锁");
@@ -56,11 +56,11 @@ pub fn get_data_dir() -> Result<PathBuf, ()> {
             debug!("[修改版本2] 当前数据目录路径: {:?}", path);
             debug!("[修改版本2] get_data_dir 执行完成");
             Ok(path)
-        },
+        }
         Err(e) => {
             // 锁可能已经被毒化(poisoned)，这通常发生在另一个线程在持有锁时发生了panic
             error!("[修改版本2] 无法获取 ANDROID_DATA_DIR 锁: {:?}", e);
-            
+
             // 尝试获取被毒化的锁
             if let Ok(poisoned_lock) = ANDROID_DATA_DIR.lock() {
                 error!("[修改版本2] 获取到被毒化的锁，尝试恢复");
@@ -70,7 +70,9 @@ pub fn get_data_dir() -> Result<PathBuf, ()> {
             } else {
                 error!("[修改版本2] 无法恢复被毒化的锁，返回默认路径");
                 // 返回一个默认路径，避免崩溃
-                Ok(PathBuf::from("/data/user/0/net.activitywatch.android/files"))
+                Ok(PathBuf::from(
+                    "/data/user/0/net.activitywatch.android/files",
+                ))
             }
         }
     }
@@ -136,14 +138,14 @@ pub fn get_log_dir(module: &str) -> Result<PathBuf, ()> {
 
 pub fn db_path(testing: bool) -> Result<PathBuf, ()> {
     debug!("[修改版本2] db_path 开始执行，testing: {}", testing);
-    
+
     debug!("[修改版本2] 步骤1: 调用 get_data_dir 获取数据目录");
     let data_dir_result = get_data_dir();
-    
+
     match data_dir_result {
         Ok(mut db_path) => {
             debug!("[修改版本2] 成功获取数据目录: {:?}", db_path);
-            
+
             debug!("[修改版本2] 步骤2: 添加数据库文件名");
             if testing {
                 debug!("[修改版本2] 使用测试数据库文件名");
@@ -152,14 +154,14 @@ pub fn db_path(testing: bool) -> Result<PathBuf, ()> {
                 debug!("[修改版本2] 使用正式数据库文件名");
                 db_path.push("sqlite.db");
             }
-            
+
             debug!("[修改版本2] 最终数据库路径: {:?}", db_path);
             debug!("[修改版本2] db_path 执行完成");
             Ok(db_path)
-        },
+        }
         Err(e) => {
             error!("[修改版本2] 获取数据目录失败: {:?}", e);
-            
+
             // 创建一个默认路径，避免崩溃
             let mut default_path = PathBuf::from("/data/user/0/net.activitywatch.android/files");
             if testing {
@@ -167,7 +169,7 @@ pub fn db_path(testing: bool) -> Result<PathBuf, ()> {
             } else {
                 default_path.push("sqlite.db");
             }
-            
+
             error!("[修改版本2] 使用默认数据库路径: {:?}", default_path);
             Ok(default_path)
         }
@@ -177,25 +179,28 @@ pub fn db_path(testing: bool) -> Result<PathBuf, ()> {
 #[cfg(target_os = "android")]
 pub fn set_android_data_dir(path: &str) {
     debug!("[修改版本2] set_android_data_dir 开始执行，路径: {}", path);
-    
+
     // 尝试获取锁，并处理可能的错误
     debug!("[修改版本2] 尝试获取 ANDROID_DATA_DIR 锁");
     let lock_result = ANDROID_DATA_DIR.lock();
-    
+
     match lock_result {
         Ok(mut android_data_dir) => {
             debug!("[修改版本2] 成功获取 ANDROID_DATA_DIR 锁");
-            debug!("[修改版本2] 当前路径: {:?}, 准备更新为: {}", *android_data_dir, path);
-            
+            debug!(
+                "[修改版本2] 当前路径: {:?}, 准备更新为: {}",
+                *android_data_dir, path
+            );
+
             // 更新路径
             *android_data_dir = PathBuf::from(path);
-            
+
             debug!("[修改版本2] 路径已更新为: {:?}", *android_data_dir);
-        },
+        }
         Err(e) => {
             // 锁可能已经被毒化(poisoned)，这通常发生在另一个线程在持有锁时发生了panic
             error!("[修改版本2] 无法获取 ANDROID_DATA_DIR 锁: {:?}", e);
-            
+
             // 尝试获取被毒化的锁
             if let Ok(mut poisoned_lock) = ANDROID_DATA_DIR.lock() {
                 error!("[修改版本2] 获取到被毒化的锁，尝试恢复");
@@ -206,7 +211,7 @@ pub fn set_android_data_dir(path: &str) {
             }
         }
     }
-    
+
     debug!("[修改版本2] set_android_data_dir 执行完成");
 }
 

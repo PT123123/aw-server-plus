@@ -3,7 +3,7 @@ use std::fs;
 use uuid::Uuid;
 
 use crate::dirs;
-use log::{info, debug, error}; // Import logging macros
+use log::{debug, error, info}; // Import logging macros
 
 /// Retrieves the device ID, if none exists it generates one (using UUID v4)
 pub fn get_device_id() -> String {

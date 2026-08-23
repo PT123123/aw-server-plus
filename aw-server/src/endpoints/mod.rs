@@ -74,7 +74,11 @@ impl Fairing for CSPFairing {
         }
     }
 
-    async fn on_response<'r>(&self, _request: &'r rocket::Request<'_>, response: &mut rocket::Response<'r>) {
+    async fn on_response<'r>(
+        &self,
+        _request: &'r rocket::Request<'_>,
+        response: &mut rocket::Response<'r>,
+    ) {
         response.set_header(Header::new(
             "Content-Security-Policy",
             "default-src 'self'; connect-src 'self' http://localhost:5600 http://localhost:5600 ws://localhost:5600 ws://localhost:5600 http://127.0.0.1:5600 http://127.0.0.1:5600; script-src 'self' 'unsafe-eval'; img-src 'self' blob: data: http://127.0.0.1:5600; style-src 'self' 'unsafe-inline'; font-src 'self'; frame-src 'self'; manifest-src 'self'; upgrade-insecure-requests; block-all-mixed-content;",
