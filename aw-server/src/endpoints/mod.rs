@@ -81,8 +81,46 @@ impl Fairing for CSPFairing {
     ) {
         response.set_header(Header::new(
             "Content-Security-Policy",
-            "default-src 'self'; connect-src 'self' http://localhost:5600 http://localhost:5600 ws://localhost:5600 ws://localhost:5600 http://127.0.0.1:5600 http://127.0.0.1:5600; script-src 'self' 'unsafe-eval'; img-src 'self' blob: data: http://127.0.0.1:5600; style-src 'self' 'unsafe-inline'; font-src 'self'; frame-src 'self'; manifest-src 'self'; upgrade-insecure-requests; block-all-mixed-content;",
+            "default-src 'self'; connect-src 'self' http://localhost:5600 http://localhost:5600 ws://localhost:5600 ws://localhost:5600 http://127.0.0.1:5600 http://127.0.0.1:5600 http://10.0.2.2:5600 ws://10.0.2.2:5600; script-src 'self' 'unsafe-eval'; img-src 'self' blob: data: http://127.0.0.1:5600 http://10.0.2.2:5600; style-src 'self' 'unsafe-inline'; font-src 'self'; frame-src 'self'; manifest-src 'self'; upgrade-insecure-requests; block-all-mixed-content;",
         ));
+    }
+}
+
+// No-Cache Fairing — prevents WebView from caching stale webui assets
+pub struct NoCacheFairing;
+
+#[rocket::async_trait]
+impl Fairing for NoCacheFairing {
+    fn info(&self) -> rocket::fairing::Info {
+        rocket::fairing::Info {
+            name: "No-Cache for webui assets",
+            kind: rocket::fairing::Kind::Response,
+        }
+    }
+
+    async fn on_response<'r>(
+        &self,
+        request: &'r rocket::Request<'_>,
+        response: &mut rocket::Response<'r>,
+    ) {
+        let uri = request.uri().path().as_str();
+        if uri.starts_with("/js/")
+            || uri.starts_with("/css/")
+            || uri == "/"
+            || uri == "/index.html"
+            || uri.starts_with("/static/")
+            || uri == "/favicon.ico"
+            || uri == "/dark.css"
+            || uri == "/logo.png"
+            || uri == "/manifest.json"
+        {
+            response.set_header(Header::new(
+                "Cache-Control",
+                "no-cache, no-store, must-revalidate",
+            ));
+            response.set_header(Header::new("Pragma", "no-cache"));
+            response.set_header(Header::new("Expires", "0"));
+        }
     }
 }
 
@@ -174,7 +212,8 @@ pub fn build_rocket(server_state: ServerState, config: AWConfig) -> rocket::Rock
         // request is rewritten to the 403 route before they inspect the path.
         .attach(extension_cors)
         .attach(hostcheck)
-        .attach(CSPFairing) // 添加 CSP Fairing here
+        .attach(CSPFairing)
+        .attach(NoCacheFairing)
         .manage(cors)
         .manage(server_state)
         .manage(config)

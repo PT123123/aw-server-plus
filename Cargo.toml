@@ -7,6 +7,7 @@ members = [
     "aw-server",
     "aw-inbox-rust",
     "aw-sync",
+    "aw-sync-rust",
     "aw-query",
 ]
 resolver = "2"

@@ -19,8 +19,6 @@ gradle/wrapper/gradle-8.1-bin.zip
 platform-tools-latest-linux.zip
 platform-tools/
 
-# 误放的源文件
-aw-server
 
 # 自动生成的 fastlane 图标
 fastlane/metadata/android/en-US/images/icon.png

@@ -46,6 +46,7 @@ aw-models = { path = "../aw-models" }
 aw-transform = { path = "../aw-transform" }
 aw-query = { path = "../aw-query" }
 aw-inbox-rust = { path = "../aw-inbox-rust" }
+aw-sync-rust = { path = "../aw-sync-rust" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [target.'cfg(target_os="linux")'.dependencies]

@@ -14,6 +14,7 @@ pub fn cors(config: &AWConfig) -> rocket_cors::Cors {
     allowed_exact_origins.push("http://localhost:5600".to_string());
     allowed_exact_origins.push("http://127.0.0.1:5600".to_string());
     allowed_exact_origins.push("http://127.0.0.1:5600".to_string());
+    allowed_exact_origins.push("http://10.0.2.2:5600".to_string());
 
     // 如果你的前端通过 WebSocket 连接到这些端口，你可能还需要添加到 allowed_origins
     // 但 AllowedOrigins::some 主要处理 HTTP(S)

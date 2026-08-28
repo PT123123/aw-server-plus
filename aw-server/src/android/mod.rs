@@ -443,10 +443,13 @@ pub mod android {
         debug!("开始加载默认服务器配置...");
         let mut server_config: AWConfig = AWConfig::default();
         server_config.port = 5600;
-        debug!("服务器配置加载完成，端口设置为: {}", server_config.port);
+        server_config.address = "0.0.0.0".to_string();
+        debug!("服务器配置加载完成, 端口={}, 地址={}", server_config.port, server_config.address);
 
         debug!("开始构建 Rocket 服务器...");
-        let rocket = endpoints::build_rocket(server_state, server_config);
+        // 供同步模块使用（在 server_state 被 move 之前记录）
+        let sync_device_id = server_state.device_id.clone();
+        let mut rocket = endpoints::build_rocket(server_state, server_config);
 
         // ===== 初始化 aw-inbox-rust（Android 端此前缺失此逻辑）=====
         info!("[AW_INBOX] 开始初始化 inbox 数据库连接池...");
@@ -460,7 +463,7 @@ pub mod android {
             warn!("[AW_INBOX] 无法获取 data_dir，将使用默认路径");
         }
 
-        let rocket = match aw_inbox_rust::db::init_pool().await {
+        let mut rocket = match aw_inbox_rust::db::init_pool().await {
             Ok(pool) => {
                 info!("[AW_INBOX] inbox 数据库连接池初始化成功");
                 // 执行数据库迁移
@@ -481,6 +484,22 @@ pub mod android {
                 rocket
             }
         };
+
+        // ===== 挂载局域网同步 (aw-sync-rust) =====
+        if let Ok(data_dir_sync) = crate::dirs::get_data_dir() {
+            match aw_sync_rust::SyncManager::new(data_dir_sync.as_path(), sync_device_id) {
+                Ok(mgr) => {
+                    if let Ok(g) = mgr.lock() {
+                        let _ = g.spawn_discovery();
+                    }
+                    rocket = aw_sync_rust::endpoints::mount_rocket(rocket, mgr);
+                    info!("[AW_SYNC] 局域网同步路由已挂载 (aw-sync-rust)");
+                }
+                Err(e) => error!("[AW_SYNC] 局域网同步挂载失败(服务器继续启动): {e}"),
+            }
+        } else {
+            warn!("[AW_SYNC] 无法获取数据目录，跳过局域网同步挂载");
+        }
 
         debug!("开始启动 Rocket 服务器...");
         let launch_result = rocket.launch().await;
@@ -676,6 +695,26 @@ pub mod android {
 
         info!("[修改版本3] Android 数据目录设置完成");
         debug!("[修改版本3] setDataDir 执行完成");
+    }
+
+    /// 由 Android 侧注入从 Wi-Fi 链路直接读取到的本机 IP（绕过 VPN 隧道），
+    /// 供局域网同步广播/展示使用。空或非法值会被忽略，退回 Rust 侧枚举网卡结果。
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_setSyncLocalIp(
+        env: JNIEnv,
+        _: JClass,
+        java_ip: JString,
+    ) {
+        debug!("[AW_SYNC] setSyncLocalIp 开始执行...");
+        let ip = match env.get_string(java_ip) {
+            Ok(s) => s.to_string_lossy().to_string(),
+            Err(e) => {
+                error!("[AW_SYNC] setSyncLocalIp 解析 JString 失败: {:?}", e);
+                return;
+            }
+        };
+        debug!("[AW_SYNC] setSyncLocalIp 收到 IP: {}", ip);
+        aw_sync_rust::set_local_ip_override(ip);
     }
 
     #[no_mangle]

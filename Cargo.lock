@@ -292,6 +292,7 @@ dependencies = [
  "aw-inbox-rust",
  "aw-models",
  "aw-query",
+ "aw-sync-rust",
  "aw-transform",
  "chrono",
  "clap",
@@ -338,6 +339,26 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+]
+
+[[package]]
+name = "aw-sync-rust"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "gethostname",
+ "libc",
+ "log",
+ "rand 0.8.7",
+ "reqwest",
+ "rocket",
+ "rocket_cors",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

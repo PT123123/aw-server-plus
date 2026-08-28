@@ -190,6 +190,7 @@ async fn main() -> Result<(), rocket::Error> {
         asset_resolver: endpoints::AssetResolver::new(asset_path),
         device_id,
     };
+    let sync_device_id = server_state.device_id.clone();
 
     let rocket = endpoints::build_rocket(server_state, config);
 
@@ -202,6 +203,21 @@ async fn main() -> Result<(), rocket::Error> {
     db::migrate(&pool).expect("数据库迁移失败");
     let shared_db: SharedDb = Arc::new(StdMutex::new(pool));
     let rocket = plugins::register_all_plugins(rocket, shared_db);
+    let mut rocket = rocket;
+
+    // ===== 挂载局域网同步 (aw-sync-rust) =====
+    if let Ok(data_dir_sync) = dirs::get_data_dir() {
+        match aw_sync_rust::SyncManager::new(data_dir_sync.as_path(), sync_device_id) {
+            Ok(mgr) => {
+                if let Ok(g) = mgr.lock() {
+                    let _ = g.spawn_discovery();
+                }
+                rocket = aw_sync_rust::endpoints::mount_rocket(rocket, mgr);
+                info!("局域网同步路由已挂载 (aw-sync-rust)");
+            }
+            Err(e) => info!("局域网同步挂载失败(继续启动): {e}"),
+        }
+    }
 
     let _rocket = rocket.ignite().await?;
     #[cfg(target_os = "linux")]
