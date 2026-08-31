@@ -10,6 +10,14 @@ cd "$SCRIPT_DIR"
 
 set -x
 platform="$(uname -s | tr '[:upper:]' '[:lower:]')"
+case "$platform" in
+    *mingw*|*msys*|*cygwin*) platform="windows" ;;
+    darwin*)                 platform="darwin" ;;
+    *)                       platform="linux" ;;
+esac
+# Suffix for native toolchain binaries (.exe on Windows)
+exe=""
+if [ "$platform" = "windows" ]; then exe=".exe"; fi
 
 # if args, use them to select targets (x86_64, arm64, etc)
 if [ $# -gt 0 ]; then
@@ -33,6 +41,8 @@ if [ -z "$ANDROID_NDK_HOME" ]; then
         exit 1
     fi
 fi
+# Normalize path separators (Windows backslashes -> forward slashes)
+ANDROID_NDK_HOME="${ANDROID_NDK_HOME//\\//}"
 export ANDROID_NDK_HOME
 
 if [ "$RELEASE" = "true" ]; then
@@ -86,14 +96,24 @@ for archtargetstr in \
     export RUSTFLAGS="$ORIG_RUSTFLAGS"
     # Need to set AR for target since NDK 21+:
     #   https://github.com/rust-lang/cc-rs/issues/636#issuecomment-1075352495
-    cc="$NDK_ARCH_DIR/${target}-clang"
-    if [ "$arch" = "arm" ]; then
-        cc="$NDK_ARCH_DIR/arm-linux-androideabi-clang"
+    if [ "$platform" = "windows" ]; then
+        # Windows: no symlinks; install-ndk.sh creates clang.exe copies named
+        # "<triple>26-clang.exe" (clang derives target+API from argv[0]).
+        if [ "$arch" = "arm" ]; then
+            cc="$NDK_ARCH_DIR/armv7a-linux-androideabi26-clang.exe"
+        else
+            cc="$NDK_ARCH_DIR/${target}26-clang.exe"
+        fi
+    else
+        cc="$NDK_ARCH_DIR/${target}-clang"
+        if [ "$arch" = "arm" ]; then
+            cc="$NDK_ARCH_DIR/arm-linux-androideabi-clang"
+        fi
     fi
 
-    declare -x "AR_${target_underscore}"="$NDK_ARCH_DIR/llvm-ar"
+    declare -x "AR_${target_underscore}"="$NDK_ARCH_DIR/llvm-ar$exe"
     declare -x "CC_${target_underscore}"="$cc"
-    declare -x "RANLIB_${target_underscore}"="$NDK_ARCH_DIR/llvm-ranlib"
+    declare -x "RANLIB_${target_underscore}"="$NDK_ARCH_DIR/llvm-ranlib$exe"
 
     # Needed for runtime error: https://github.com/termux/termux-packages/issues/8029
     #   java.lang.UnsatisfiedLinkError: dlopen failed: cannot locate symbol "__extenddftf2"
