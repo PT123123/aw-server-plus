@@ -112,8 +112,19 @@ for archtargetstr in \
     fi
 
     declare -x "AR_${target_underscore}"="$NDK_ARCH_DIR/llvm-ar$exe"
-    declare -x "CC_${target_underscore}"="$cc"
+    # Use the bare compiler basename (resolved via PATH) for CC_<target>.
+    # openssl-src passes this to its `./Configure`, which otherwise detects
+    # the `aarch64-linux-android26-` prefix in the full path and reconstructs a
+    # Windows backslash path (`.../bin\clang.exe`); MSYS `/bin/sh` then eats the
+    # backslash into `.../binclang.exe` and the build fails. The NDK wrapper
+    # derives target/API from its own filename, so a bare basename works
+    # identically for both rustc and openssl.
+    declare -x "CC_${target_underscore}"="$(basename "$cc")"
     declare -x "RANLIB_${target_underscore}"="$NDK_ARCH_DIR/llvm-ranlib$exe"
+    # rustc's default linker for this target is `cc`, which isn't the NDK
+    # clang. Point it at the same wrapper (full path) used for CC so linking
+    # works on Windows without manual env setup.
+    declare -x "CARGO_TARGET_${target_underscore^^}_LINKER"="$cc"
 
     # Needed for runtime error: https://github.com/termux/termux-packages/issues/8029
     #   java.lang.UnsatisfiedLinkError: dlopen failed: cannot locate symbol "__extenddftf2"
@@ -125,9 +136,18 @@ for archtargetstr in \
 
     # check that they exist
     for var in AR_${target_underscore} CC_${target_underscore} RANLIB_${target_underscore}; do
-        if [ ! -f "${!var}" ]; then
-            echo "Couldn't find ${!var} set for variable $var"
-            exit 1
+        val="${!var}"
+        if [[ "$var" == CC_* ]]; then
+            # CC is a bare basename resolved via PATH
+            if ! command -v "$val" >/dev/null 2>&1; then
+                echo "Couldn't find $val on PATH (needed for variable $var)"
+                exit 1
+            fi
+        else
+            if [ ! -f "$val" ]; then
+                echo "Couldn't find $val set for variable $var"
+                exit 1
+            fi
         fi
     done
 
