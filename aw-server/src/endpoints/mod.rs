@@ -57,7 +57,6 @@ mod export;
 mod extension_cors;
 mod hostcheck;
 mod import;
-mod query;
 mod settings;
 
 pub use util::HttpErrorJson;
@@ -249,7 +248,6 @@ pub fn build_rocket(server_state: ServerState, config: AWConfig) -> rocket::Rock
                 bucket::bucket_export
             ],
         )
-        .mount("/api/0/query", routes![query::query])
         .mount(
             "/api/0/import",
             routes![import::bucket_import_json, import::bucket_import_form],

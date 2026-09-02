@@ -31,5 +31,4 @@ pub mod android;
 
 extern crate aw_datastore;
 extern crate aw_models;
-extern crate aw_query;
 extern crate aw_transform;
