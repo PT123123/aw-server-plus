@@ -433,7 +433,6 @@ pub mod android {
             debug!("开始创建服务器状态...");
             endpoints::ServerState {
                 datastore: openDatastore(),
-                asset_resolver: endpoints::AssetResolver::new(None),
                 device_id: device_id::get_device_id(),
             }
         };

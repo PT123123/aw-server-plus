@@ -46,10 +46,6 @@ struct Opts {
     #[clap(short = 'c', long = "config")]
     config: Option<PathBuf>,
 
-    /// Path to webui override
-    #[clap(long)]
-    webpath: Option<String>,
-
     /// Mapping of custom static paths to serve, in the format: watcher1=/path,watcher2=/path2
     #[clap(long)]
     custom_static: Option<String>,
@@ -141,9 +137,6 @@ async fn main() -> Result<(), rocket::Error> {
     };
     info!("Using DB at path {:?}", db_path);
 
-    let asset_path = opts.webpath.map(PathBuf::from);
-    info!("Using aw-webui assets at path {:?}", asset_path);
-
     // Only use legacy import if opts.dbpath is not set
     let legacy_import = !opts.no_legacy_import && opts.dbpath.is_none();
     if opts.dbpath.is_some() {
@@ -187,7 +180,6 @@ async fn main() -> Result<(), rocket::Error> {
         // Even if legacy_import is set to true it is disabled on Android so
         // it will not happen there
         datastore,
-        asset_resolver: endpoints::AssetResolver::new(asset_path),
         device_id,
     };
     let sync_device_id = server_state.device_id.clone();

@@ -124,7 +124,6 @@ mod tests {
     fn setup_testserver(address: String) -> Rocket<rocket::Build> {
         let state = endpoints::ServerState {
             datastore: aw_datastore::Datastore::new_in_memory(false),
-            asset_resolver: endpoints::AssetResolver::new(None),
             device_id: "test_id".to_string(),
         };
         let aw_config = AWConfig {

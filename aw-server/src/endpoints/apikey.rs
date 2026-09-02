@@ -13,7 +13,7 @@
 //! ```
 //!
 //! Exempt paths (always public):
-//! - `GET /api/0/info` — health/version endpoint used by clients and the webui
+//! - `GET /api/0/info` — health/version endpoint used by clients
 //!
 //! CORS preflight requests (OPTIONS) are also passed through unconditionally so
 //! the browser can obtain allowed headers before sending the actual request.
@@ -170,7 +170,6 @@ mod tests {
     fn setup_testserver(api_key: Option<String>) -> Rocket<rocket::Build> {
         let state = endpoints::ServerState {
             datastore: aw_datastore::Datastore::new_in_memory(false),
-            asset_resolver: endpoints::AssetResolver::new(None),
             device_id: "test_id".to_string(),
         };
         let mut aw_config = AWConfig::default();
