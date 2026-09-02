@@ -1,10 +1,11 @@
 /// 注册所有插件（目前只集成 aw-inbox）
 use log::info;
-pub use aw_inbox_rust::SharedDb;
+pub use aw_inbox_rust::{SharedDb, SharedTodoDb};
 
 pub fn register_all_plugins(
     rocket: rocket::Rocket<rocket::Build>,
     db: SharedDb,
+    todo_db: SharedTodoDb,
 ) -> rocket::Rocket<rocket::Build> {
     use rocket::figment::Figment;
     let figment: &Figment = rocket.figment();
@@ -16,5 +17,5 @@ pub fn register_all_plugins(
         "[INBOX] aw-inbox-rust 已挂载到主服务，访问入口: http://{}:{}/inbox",
         address, port
     );
-    aw_inbox_rust::mount_rocket(rocket, db)
+    aw_inbox_rust::mount_rocket(rocket, db, todo_db)
 }

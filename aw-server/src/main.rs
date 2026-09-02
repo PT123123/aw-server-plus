@@ -196,13 +196,16 @@ async fn main() -> Result<(), rocket::Error> {
 
     // 初始化 aw-inbox-rust 的数据库连接池并注入
     use aw_inbox_rust::db;
-    use aw_inbox_rust::SharedDb;
+    use aw_inbox_rust::{SharedDb, SharedTodoDb};
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
     let pool = db::init_pool().await.expect("Failed to init inbox db pool");
     db::migrate(&pool).expect("数据库迁移失败");
     let shared_db: SharedDb = Arc::new(StdMutex::new(pool));
-    let rocket = plugins::register_all_plugins(rocket, shared_db);
+    let todo_pool = db::init_todo_pool().await.expect("Failed to init todo db pool");
+    db::migrate_todo(&todo_pool).expect("todo 数据库迁移失败");
+    let shared_todo_db: SharedTodoDb = SharedTodoDb(Arc::new(StdMutex::new(todo_pool)));
+    let rocket = plugins::register_all_plugins(rocket, shared_db, shared_todo_db);
     let mut rocket = rocket;
 
     // ===== 挂载局域网同步 (aw-sync-rust) =====
