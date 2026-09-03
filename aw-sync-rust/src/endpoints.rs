@@ -328,7 +328,7 @@ async fn devices(state: &State<SharedManager>) -> Res {
 async fn sync_now(state: &State<SharedManager>, id: String) -> Res {
     run(state, move |m| {
         let applied = m.sync_to(&id)?;
-        Ok(serde_json::json!({ "device_id": id, "applied": applied }))
+        Ok(serde_json::json!({ "device_id": id, "applied": applied.applied, "result": applied }))
     })
     .await
 }
@@ -503,7 +503,7 @@ async fn push(state: &State<SharedManager>, snap: Json<SyncSnapshot>) -> Res {
     let snap = snap.into_inner();
     run(state, move |m| {
         let applied = m.apply_snapshot(&snap)?;
-        crate::dbglog::info(format!("[push] /push 处理完成: 应用记录数 {}", applied));
+        crate::dbglog::info(format!("[push] /push 处理完成: 应用记录数 {}", applied.applied));
         let peer_id = snap.source_device.as_ref().map(|d| d.id.clone());
         let peer_id_str = peer_id.clone().unwrap_or_default();
         let peer_name = snap
@@ -532,7 +532,7 @@ async fn push(state: &State<SharedManager>, snap: Json<SyncSnapshot>) -> Res {
                 m.self_id(),
                 peer_name,
                 peer_id_str,
-                applied
+                applied.applied
             )),
             data_size: Some(
                 snap.activity.as_ref().map_or(0, |s| s.len() as u64)
@@ -540,7 +540,7 @@ async fn push(state: &State<SharedManager>, snap: Json<SyncSnapshot>) -> Res {
                     + snap.todo.as_ref().map_or(0, |s| s.len() as u64),
             ),
         });
-        Ok(serde_json::json!({ "applied": applied }))
+        Ok(serde_json::json!({ "applied": applied.applied, "result": applied }))
     })
     .await
 }
@@ -590,7 +590,7 @@ async fn apply(state: &State<SharedManager>, snap: Json<SyncSnapshot>) -> Res {
                 }
             }
         }
-        crate::dbglog::info(format!("[wifi] /apply 处理完成: 应用记录数 {}", applied));
+        crate::dbglog::info(format!("[wifi] /apply 处理完成: 应用记录数 {}", applied.applied));
         let _ = m.add_log(&SyncLogEntry {
             id: None,
             timestamp: chrono::Utc::now(),
@@ -604,7 +604,7 @@ async fn apply(state: &State<SharedManager>, snap: Json<SyncSnapshot>) -> Res {
                 m.self_id(),
                 peer.name,
                 peer.id,
-                applied
+                applied.applied
             )),
             data_size: Some(
                 snap.activity.as_ref().map_or(0, |s| s.len() as u64)
@@ -612,7 +612,58 @@ async fn apply(state: &State<SharedManager>, snap: Json<SyncSnapshot>) -> Res {
                     + snap.todo.as_ref().map_or(0, |s| s.len() as u64),
             ),
         });
-        Ok(serde_json::json!({ "applied": applied }))
+        Ok(serde_json::json!({ "applied": applied.applied, "result": applied }))
+    })
+    .await
+}
+
+// ---- 回收站（trash，P0）----
+
+#[derive(FromForm)]
+struct TrashQuery {
+    kind: Option<String>,
+}
+
+#[get("/trash?<query..>")]
+async fn trash_list(state: &State<SharedManager>, query: TrashQuery) -> Res {
+    run(state, move |m| {
+        let list = m.list_trash(query.kind.as_deref()).map_err(|e| e.to_string())?;
+        let count = m.trash_count().map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "trash": list, "count": count }))
+    })
+    .await
+}
+
+#[post("/trash/<id>/restore")]
+async fn trash_restore(state: &State<SharedManager>, id: i64) -> Res {
+    run(state, move |m| {
+        let restored = m.restore_trash(id).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "restored": restored, "id": id }))
+    })
+    .await
+}
+
+#[delete("/trash/<id>")]
+async fn trash_delete(state: &State<SharedManager>, id: i64) -> Res {
+    run(state, move |m| {
+        let deleted = m.delete_trash(id).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "deleted": deleted, "id": id }))
+    })
+    .await
+}
+
+/// 手动清空回收站（全部删除）。
+#[delete("/trash")]
+async fn trash_clear_all(state: &State<SharedManager>) -> Res {
+    run(state, move |m| {
+        let mut deleted = 0usize;
+        let list = m.list_trash(None).map_err(|e| e.to_string())?;
+        for t in &list {
+            if m.delete_trash(t.id).map_err(|e| e.to_string())? {
+                deleted += 1;
+            }
+        }
+        Ok(serde_json::json!({ "cleared": deleted }))
     })
     .await
 }
@@ -681,7 +732,8 @@ pub fn mount_rocket(rocket: Rocket<Build>, mgr: SharedManager) -> Rocket<Build> 
                 devices, add_device,
                 sync_now, device_delete, device_alias, devices_clear_all,
                 device_stats, device_conflicts,
-                logs, log_clear, push, apply, snapshot, debug_log, status
+                logs, log_clear, push, apply, snapshot, debug_log, status,
+                trash_list, trash_restore, trash_delete, trash_clear_all
             ],
         )
 }

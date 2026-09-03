@@ -116,7 +116,8 @@ pub fn migrate(conn: &DbConnection) -> Result<(), Error> {
             version INTEGER NOT NULL DEFAULT 1,
             device_id TEXT,
             deleted INTEGER NOT NULL DEFAULT 0,
-            synced_at TEXT
+            synced_at TEXT,
+            uuid TEXT
         );
 
         DROP TABLE IF EXISTS comments;
@@ -131,23 +132,6 @@ pub fn migrate(conn: &DbConnection) -> Result<(), Error> {
             FOREIGN KEY (target_note_id) REFERENCES notes(id) ON DELETE CASCADE
         );
 
-        CREATE TABLE IF NOT EXISTS sync_versions (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            global_version INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS devices (
-            device_id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            platform TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL,
-            last_synced_at TEXT,
-            pending_changes INTEGER NOT NULL DEFAULT 0,
-            version INTEGER NOT NULL DEFAULT 0,
-            is_current INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'OFFLINE'
-        );
-
         "#,
     )?;
 
@@ -156,6 +140,12 @@ pub fn migrate(conn: &DbConnection) -> Result<(), Error> {
     ensure_column(conn, "notes", "device_id", "TEXT")?;
     ensure_column(conn, "notes", "deleted", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "notes", "synced_at", "TEXT")?;
+    ensure_column(conn, "notes", "uuid", "TEXT")?;
+    // 为历史行补齐 uuid（P0 同步逻辑键；SQLite 对每行重新求值 randomblob）
+    conn.execute(
+        "UPDATE notes SET uuid = lower(hex(randomblob(16))) WHERE uuid IS NULL OR uuid = ''",
+        [],
+    )?;
 
     // 索引（放在 ensure_column 之后，避免引用不存在的列）
     conn.execute_batch(
@@ -167,12 +157,6 @@ pub fn migrate(conn: &DbConnection) -> Result<(), Error> {
         CREATE INDEX IF NOT EXISTS idx_notes_device_id ON notes(device_id);
         CREATE INDEX IF NOT EXISTS idx_notes_synced_at ON notes(synced_at);
         "#,
-    )?;
-
-    // 初始化全局版本
-    conn.execute(
-        "INSERT OR IGNORE INTO sync_versions (id, global_version) VALUES (1, 0)",
-        [],
     )?;
 
     info!("✅ 数据库迁移完成");
@@ -197,13 +181,10 @@ pub fn migrate_todo(conn: &DbConnection) -> Result<(), Error> {
             version INTEGER NOT NULL DEFAULT 1,
             device_id TEXT,
             deleted INTEGER NOT NULL DEFAULT 0,
-            synced_at TEXT
+            synced_at TEXT,
+            uuid TEXT
         );
 
-        CREATE TABLE IF NOT EXISTS sync_versions (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            global_version INTEGER NOT NULL DEFAULT 0
-        );
         "#,
     )?;
 
@@ -212,6 +193,12 @@ pub fn migrate_todo(conn: &DbConnection) -> Result<(), Error> {
     ensure_column(conn, "todos", "device_id", "TEXT")?;
     ensure_column(conn, "todos", "deleted", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "todos", "synced_at", "TEXT")?;
+    ensure_column(conn, "todos", "uuid", "TEXT")?;
+    // 为历史行补齐 uuid（P0 同步逻辑键）
+    conn.execute(
+        "UPDATE todos SET uuid = lower(hex(randomblob(16))) WHERE uuid IS NULL OR uuid = ''",
+        [],
+    )?;
 
     conn.execute_batch(
         r#"
@@ -275,8 +262,8 @@ pub fn create_note_db(
 
     tx.execute(
         r#"
-        INSERT INTO notes (content, tags, created_at, updated_at, version, device_id, deleted, synced_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)
+        INSERT INTO notes (uuid, content, tags, created_at, updated_at, version, device_id, deleted, synced_at)
+        VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)
         "#,
         params![
             payload.content,
@@ -724,7 +711,7 @@ pub fn add_comment_db(
     )?;
 
     tx.execute(
-        "INSERT INTO notes (content, tags, created_at, updated_at, version, device_id, deleted, synced_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+        "INSERT INTO notes (uuid, content, tags, created_at, updated_at, version, device_id, deleted, synced_at) VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, 0, ?)",
         params![payload.content, tags_json, created_at, updated_at, global_version, Option::<String>::None, created_at],
     )?;
 
@@ -763,132 +750,6 @@ pub fn add_comment_db(
         },
     ))
 }
-
-// ==================== 同步相关数据库操作 ====================
-
-// 获取当前全局版本
-pub fn get_global_version(conn: &DbConnection) -> Result<i64, Error> {
-    let version: i64 = conn.query_row(
-        "SELECT global_version FROM sync_versions WHERE id = 1",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(version)
-}
-
-// 获取增量笔记（版本号大于 base_version）
-pub fn get_notes_since_version(
-    conn: &DbConnection,
-    base_version: i64,
-    limit: i64,
-) -> Result<Vec<Note>, Error> {
-    let mut stmt = conn.prepare(
-        "SELECT id, content, tags, created_at, updated_at, version, device_id, deleted, synced_at 
-         FROM notes 
-         WHERE version > ?1 
-         ORDER BY version ASC 
-         LIMIT ?2"
-    )?;
-    let notes_iter = stmt.query_map(params![base_version, limit], map_row_to_note)?;
-    
-    let mut notes = Vec::new();
-    for note_result in notes_iter {
-        notes.push(note_result?);
-    }
-    Ok(notes)
-}
-
-// 更新设备心跳
-pub fn update_device_heartbeat(
-    conn: &mut DbConnection,
-    device_id: &str,
-    name: &str,
-    platform: &str,
-    pending_changes: i64,
-    local_version: i64,
-) -> Result<(), Error> {
-    let now = Utc::now();
-    conn.execute(
-        r#"
-        INSERT INTO devices (device_id, name, platform, last_seen_at, last_synced_at, pending_changes, version, is_current, status)
-        VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, 0, 'ONLINE')
-        ON CONFLICT(device_id) DO UPDATE SET
-            name = ?2,
-            platform = ?3,
-            last_seen_at = ?4,
-            pending_changes = ?5,
-            version = ?6,
-            status = 'ONLINE'
-        "#,
-        params![device_id, name, platform, now, pending_changes, local_version],
-    )?;
-    Ok(())
-}
-
-// 获取所有设备状态
-pub fn get_all_devices(conn: &DbConnection) -> Result<Vec<DeviceInfo>, Error> {
-    let mut stmt = conn.prepare(
-        "SELECT device_id, name, platform, last_seen_at, last_synced_at, pending_changes, version, is_current, status 
-         FROM devices 
-         ORDER BY is_current DESC, last_seen_at DESC"
-    )?;
-    let device_iter = stmt.query_map(params![], |row| {
-        Ok(DeviceInfo {
-            device_id: row.get("device_id")?,
-            name: row.get("name")?,
-            platform: row.get("platform")?,
-            last_seen_at: row.get("last_seen_at")?,
-            last_synced_at: row.get("last_synced_at")?,
-            pending_changes: row.get("pending_changes")?,
-            version: row.get("version")?,
-            is_current: row.get::<_, i64>("is_current")? != 0,
-            status: row.get("status")?,
-        })
-    })?;
-    
-    let mut devices = Vec::new();
-    for device_result in device_iter {
-        devices.push(device_result?);
-    }
-    Ok(devices)
-}
-
-// 更新设备同步时间
-pub fn update_device_synced_at(
-    conn: &mut DbConnection,
-    device_id: &str,
-) -> Result<(), Error> {
-    let now = Utc::now();
-    conn.execute(
-        "UPDATE devices SET last_synced_at = ?1, status = 'ONLINE' WHERE device_id = ?2",
-        params![now, device_id],
-    )?;
-    Ok(())
-}
-
-// 标记设备离线
-pub fn mark_device_offline(conn: &mut DbConnection, device_id: &str) -> Result<(), Error> {
-    conn.execute(
-        "UPDATE devices SET status = 'OFFLINE' WHERE device_id = ?1",
-        params![device_id],
-    )?;
-    Ok(())
-}
-
-// 设备信息结构体（数据库层）
-#[derive(Debug)]
-pub struct DeviceInfo {
-    pub device_id: String,
-    pub name: String,
-    pub platform: String,
-    pub last_seen_at: DateTime<Utc>,
-    pub last_synced_at: Option<DateTime<Utc>>,
-    pub pending_changes: i64,
-    pub version: i64,
-    pub is_current: bool,
-    pub status: String,
-}
-
 
 // ── Todo CRUD ──────────────────────────────────────────────────
 
@@ -937,9 +798,9 @@ pub fn create_todo_db(
 
     tx.execute(
         r#"
-        INSERT INTO todos (title, content, completed, priority, due_date, tags,
+        INSERT INTO todos (uuid, title, content, completed, priority, due_date, tags,
                            created_at, updated_at, completed_at, version, device_id, deleted, synced_at)
-        VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, 0, ?10)
+        VALUES (lower(hex(randomblob(16))), ?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, 0, ?10)
         "#,
         params![
             payload.title,
@@ -1107,4 +968,60 @@ pub fn delete_todo_db(conn: &mut DbConnection, todo_id: i64) -> Result<(), Error
     )?;
     tx.commit()?;
     Ok(())
+}
+
+// --- 恢复（从回收站 / 软删恢复）---
+
+/// 恢复一条软删除的笔记（deleted 1->0），bump 版本号；返回恢复后的笔记或 None（不存在/未删除）。
+pub fn restore_note_db(
+    conn: &mut DbConnection,
+    note_id: i64,
+    device_id: Option<String>,
+) -> Result<Option<Note>, Error> {
+    let updated_at = Utc::now();
+    let tx = conn.transaction()?;
+    let global_version: i64 = tx.query_row(
+        "UPDATE sync_versions SET global_version = global_version + 1 RETURNING global_version",
+        [],
+        |row| row.get(0),
+    )?;
+    let rows_affected = tx.execute(
+        r#"
+        UPDATE notes
+        SET deleted = 0, updated_at = ?1, version = ?2, device_id = ?3, synced_at = ?4
+        WHERE id = ?5 AND deleted = 1
+        "#,
+        params![updated_at, global_version, device_id, updated_at, note_id],
+    )?;
+    tx.commit()?;
+    if rows_affected > 0 {
+        get_note_db(conn, note_id)
+    } else {
+        Ok(None)
+    }
+}
+
+/// 恢复一条软删除的 todo（deleted 1->0），bump 版本号；返回恢复后的 todo 或 None。
+pub fn restore_todo_db(conn: &mut DbConnection, todo_id: i64) -> Result<Option<Todo>, Error> {
+    let updated_at = Utc::now();
+    let tx = conn.transaction()?;
+    let global_version: i64 = tx.query_row(
+        "UPDATE sync_versions SET global_version = global_version + 1 RETURNING global_version",
+        [],
+        |row| row.get(0),
+    )?;
+    let rows_affected = tx.execute(
+        r#"
+        UPDATE todos
+        SET deleted = 0, updated_at = ?1, version = ?2
+        WHERE id = ?3 AND deleted = 1
+        "#,
+        params![updated_at, global_version, todo_id],
+    )?;
+    tx.commit()?;
+    if rows_affected > 0 {
+        Ok(Some(get_todo_by_id_db(conn, todo_id)?))
+    } else {
+        Ok(None)
+    }
 }

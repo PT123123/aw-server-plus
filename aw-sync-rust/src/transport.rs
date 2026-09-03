@@ -1,4 +1,4 @@
-//! HTTP 同步传输：把本机导出的目标库快照通过 HTTP POST 推送到对端。
+//! HTTP 同步传输：把本机导出的目标库快照通过 HTTP 推送到对端，或从对端拉取。
 //!
 //! 使用阻塞 reqwest（关闭 default TLS，局域网 HTTP 传输，避免 Android/桌面 TLS 依赖）。
 
@@ -110,6 +110,30 @@ pub fn push_snapshot(target: &crate::models::Device, snapshot: &SyncSnapshot) ->
     let applied = body.get("applied").and_then(|v| v.as_u64()).unwrap_or(0);
     crate::dbglog::info(format!("[push] 推送完成: 对端应用记录数 {}", applied));
     Ok(applied as usize)
+}
+
+/// 从对端拉取快照（`GET http://<peer>:<port>/api/0/sync/snapshot`）。
+/// 对端返回 SyncSnapshot JSON（含 source_device 与各业务库载荷）。
+pub fn fetch_snapshot(target: &Device) -> Result<SyncSnapshot, String> {
+    let url = format!("{}/snapshot", target.endpoint());
+    crate::dbglog::info(format!("[pull] 开始从 {} 拉取快照 ({url})", target.name));
+    let resp = client()?
+        .get(&url)
+        .send()
+        .map_err(|e| format!("拉取快照请求失败: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("拉取快照被拒: HTTP {} ({url})", resp.status()));
+    }
+    let snap: SyncSnapshot = resp
+        .json()
+        .map_err(|e| format!("解析拉取快照响应失败: {e}"))?;
+    crate::dbglog::info(format!(
+        "[pull] 拉取完成: activity={}B inbox={}B todo={}B",
+        snap.activity.as_ref().map_or(0, |s| s.len()),
+        snap.inbox.as_ref().map_or(0, |s| s.len()),
+        snap.todo.as_ref().map_or(0, |s| s.len()),
+    ));
+    Ok(snap)
 }
 
 #[cfg(test)]

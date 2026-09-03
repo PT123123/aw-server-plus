@@ -17,8 +17,8 @@ use std::collections::HashMap;
 
 
 use crate::models::{
-    ConflictSummary, Device, DeviceKind, DeviceSyncStats, PairCode, SyncConfig, SyncDirection,
-    SyncEventType, SyncLogEntry, SyncProtocol, SyncSnapshot, SyncStatus,
+    ApplyResult, ConflictSummary, Device, DeviceKind, DeviceSyncStats, PairCode, SyncConfig,
+    SyncDirection, SyncEventType, SyncLogEntry, SyncProtocol, SyncSnapshot, SyncStatus, TrashEntry,
 };
 
 use crate::paircode::{PairError, PairingManager};
@@ -27,7 +27,7 @@ use crate::serialize::{export_activity, export_inbox, export_todo, import_activi
 
 use crate::storage::{LogFilter, SyncDb};
 
-use crate::{conflict, discovery};
+use crate::discovery;
 
 
 
@@ -270,96 +270,95 @@ impl SyncManager {
 
     /// 接收并写入本地目标库（幂等 upsert）。返回应用记录条数。
 
-    pub fn apply_snapshot(&self, snap: &SyncSnapshot) -> Result<usize, String> {
-
+    /// 接收并写入本地目标库（按 uuid 逻辑键 + rev 仲裁合并，P0 起启用）。
+    /// 返回结构化合并结果；被覆盖方归档进回收站、冲突记录写入 sync_conflicts。
+    pub fn apply_snapshot(&self, snap: &SyncSnapshot) -> Result<ApplyResult, String> {
         let src = snap
-
             .source_device
-
             .as_ref()
-
             .map(|d| format!("{}({})", d.name, d.id))
-
             .unwrap_or_else(|| "未知设备".into());
-
+        let src_id = snap.source_device.as_ref().map(|d| d.id.clone());
         crate::dbglog::info(format!("[sync] 收到来自 {} 的同步快照", src));
 
-        let mut applied = 0usize;
-
-        // 冲突处理占位：见 conflict.rs,本期采用幂等合并。
-
-        let _action = conflict::resolve_conflict(snap, None, None);
+        let mut result = ApplyResult::default();
+        let db = self.db();
 
         if let Some(activity) = &snap.activity {
-
-            applied += import_activity(self.data_dir.join("sqlite.db").as_path(), activity)
-
-                .unwrap_or(0);
-
+            match import_activity(self.data_dir.join("sqlite.db").as_path(), activity) {
+                Ok(out) => persist_outcome(&mut result, out, src_id.as_deref(), &db),
+                Err(e) => result.errors.push(format!("activity: {e}")),
+            }
         }
-
         if let Some(inbox) = &snap.inbox {
-
-            applied += import_inbox(self.data_dir.join("inbox.db").as_path(), inbox)
-
-                .unwrap_or(0);
-
+            match import_inbox(self.data_dir.join("inbox.db").as_path(), inbox) {
+                Ok(out) => persist_outcome(&mut result, out, src_id.as_deref(), &db),
+                Err(e) => result.errors.push(format!("inbox: {e}")),
+            }
         }
-
         if let Some(todo) = &snap.todo {
-
-            applied += import_todo(self.data_dir.join("todo.db").as_path(), todo)
-
-                .unwrap_or(0);
-
+            match import_todo(self.data_dir.join("todo.db").as_path(), todo) {
+                Ok(out) => persist_outcome(&mut result, out, src_id.as_deref(), &db),
+                Err(e) => result.errors.push(format!("todo: {e}")),
+            }
         }
 
-        crate::dbglog::info(format!("[sync] 快照应用完成: 来源 {}, 应用记录数 {}", src, applied));
-
-        Ok(applied)
-
+        if result.archived > 0 {
+            let _ = self.add_log(&SyncLogEntry {
+                id: None,
+                timestamp: Utc::now(),
+                direction: SyncDirection::In,
+                protocol: SyncProtocol::Http,
+                peer_id: src_id.clone(),
+                event_type: SyncEventType::Conflict,
+                status: SyncStatus::Success,
+                message: Some(format!(
+                    "合并来自 {} 的同步：{} 条进入回收站（自动仲裁，无需人工处理）",
+                    src, result.archived
+                )),
+                data_size: None,
+            });
+        }
+        crate::dbglog::info(format!(
+            "[sync] 快照应用完成: 来源 {}, applied={} archived={} errors={}",
+            src, result.applied, result.archived, result.errors.len()
+        ));
+        Ok(result)
     }
+
 
 
 
     /// 立即向某设备推送一次同步。
 
-    pub fn sync_to(&self, peer_id: &str) -> Result<usize, String> {
-
+    /// 立即与某设备执行一次「拉-合-推」双向同步。
+    /// 1) 拉取对端快照 → 2) 本地合并（冲突自动仲裁、被覆盖方进回收站）→ 3) 导出本地推给对端。
+    pub fn sync_to(&self, peer_id: &str) -> Result<ApplyResult, String> {
         let peer = self.get_device(peer_id)?.ok_or("未找到目标设备")?;
 
+        // 1) 拉取对端快照
+        let remote = crate::transport::fetch_snapshot(&peer)?;
+
+        // 2) 合并进本地
+        let applied = self.apply_snapshot(&remote)?;
+
+        // 3) 导出本地（含新合并内容）推送给对端（对端侧合并为幂等，可安全重推）
         let mut snap = SyncSnapshot {
-
             source_device: Some(self.self_device_info()),
-
             ..Default::default()
-
         };
-
         self.export(&mut snap);
+        let pushed = crate::transport::push_snapshot(&peer, &snap).unwrap_or(0);
 
-        crate::dbglog::info(format!(
-
-            "[sync] 向 {}({}) {}:{} 发起同步推送...",
-
-            peer.name, peer.id, peer.ip, peer.port
-
-        ));
-
-        let applied = crate::transport::push_snapshot(&peer, &snap)?;
-
-        self.db().mark_synced(&peer.id, Utc::now()).map_err(|e| e.to_string())?;
+        self.db()
+            .mark_synced(&peer.id, Utc::now())
+            .map_err(|e| e.to_string())?;
 
         let size = snap
-
             .activity
-
             .as_ref()
-
             .map_or(0, |s| s.len() as u64)
-
             + snap.inbox.as_ref().map_or(0, |s| s.len() as u64)
-
             + snap.todo.as_ref().map_or(0, |s| s.len() as u64);
 
         self.add_log(&SyncLogEntry {
@@ -371,15 +370,23 @@ impl SyncManager {
             event_type: SyncEventType::Sync,
             status: SyncStatus::Success,
             message: Some(format!(
-                "本机({}) 已向 {}({}) 同步 {} 条数据",
-                self.self_id, peer.name, peer.id, applied
+                "本机({}) 与 {}({}) 双向同步完成: 拉取应用 {} 条(新增{} 更新{} 删除{})，推送 {} 条，归档 {} 条",
+                self.self_id,
+                peer.name,
+                peer.id,
+                applied.applied,
+                applied.created,
+                applied.updated,
+                applied.deleted,
+                pushed,
+                applied.archived
             )),
             data_size: Some(size),
         })?;
 
         Ok(applied)
-
     }
+
 
 
 
@@ -709,6 +716,62 @@ impl SyncManager {
         self.db().get_device_conflicts(device_id).map_err(|e| e.to_string())
     }
 
+    /// 回收站列表（kind 可为 "note"/"todo"，空表示全部）。
+    pub fn list_trash(&self, kind: Option<&str>) -> Result<Vec<TrashEntry>, String> {
+        self.db().list_trash(kind).map_err(|e| e.to_string())
+    }
+
+    /// 从回收站恢复一条归档（写回业务库；安全语义：不覆盖当前胜出方）。
+    pub fn restore_trash(&self, id: i64) -> Result<bool, String> {
+        let entry = self
+            .db()
+            .get_trash(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "回收站条目不存在".to_string())?;
+        if entry.restored {
+            return Ok(false); // 已恢复过
+        }
+        let ok = match entry.kind.as_str() {
+            "note" => crate::serialize::restore_note(
+                self.data_dir.join("inbox.db").as_path(),
+                &entry.archived,
+            )?,
+            "todo" => crate::serialize::restore_todo(
+                self.data_dir.join("todo.db").as_path(),
+                &entry.archived,
+            )?,
+            _ => return Err(format!("未知归档类型 {}", entry.kind)),
+        };
+        if ok {
+            let _ = self.db().mark_trash_restored(id);
+            let _ = self.add_log(&SyncLogEntry {
+                id: None,
+                timestamp: Utc::now(),
+                direction: SyncDirection::In,
+                protocol: SyncProtocol::Http,
+                peer_id: entry.source_device.clone(),
+                event_type: SyncEventType::Conflict,
+                status: SyncStatus::Success,
+                message: Some(format!(
+                    "已从回收站恢复 {}（逻辑键 {}）",
+                    entry.kind, entry.logical_key
+                )),
+                data_size: None,
+            });
+        }
+        Ok(ok)
+    }
+
+    /// 从回收站永久删除一条归档。
+    pub fn delete_trash(&self, id: i64) -> Result<bool, String> {
+        self.db().delete_trash(id).map_err(|e| e.to_string())
+    }
+
+    /// 未恢复归档总数（供前端角标）。
+    pub fn trash_count(&self) -> Result<i64, String> {
+        self.db().count_trash().map_err(|e| e.to_string())
+    }
+
     /// 本机 Device（用于展示与广播）。
 
     pub fn self_device_info(&self) -> Device {
@@ -1020,4 +1083,48 @@ pub fn reset_discovery_started_for_testing() {
 
     set_discovery_running(false);
 
+}
+
+
+// ---- 合并结果落库：写回收站 + sync_conflicts ----
+
+fn persist_outcome(
+    result: &mut ApplyResult,
+    out: crate::serialize::ImportOutcome,
+    src_id: Option<&str>,
+    db: &SyncDb,
+) {
+    result.applied += out.applied();
+    result.created += out.created;
+    result.updated += out.updated;
+    result.deleted += out.deleted;
+    result.ignored += out.ignored_stale + out.ignored_dup;
+    result.conflicts += out.archived.len();
+    result.archived += out.archived.len();
+    result.errors.extend(out.errors);
+
+    for ar in out.archived {
+        let trash = TrashEntry {
+            id: 0,
+            kind: ar.kind.clone(),
+            logical_key: ar.logical_key.clone(),
+            archived: ar.archived_json,
+            winner_rev: ar.winner_rev.clone(),
+            reason: ar.reason.clone(),
+            source_device: src_id.map(|s| s.to_string()),
+            archived_at: Utc::now().to_rfc3339(),
+            restored: false,
+        };
+        if let Ok(tid) = db.insert_trash(&trash) {
+            let _ = db.insert_conflict(
+                src_id.unwrap_or("unknown"),
+                &ar.kind,
+                &ar.logical_key,
+                None,
+                ar.winner_rev.as_deref(),
+                &ar.reason,
+                Some(tid),
+            );
+        }
+    }
 }

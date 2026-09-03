@@ -9,7 +9,6 @@ use rocket::response::status::Created;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::task;
-use chrono::Utc;
 
 // 自定义请求守卫：提取 X-Device-ID 头部
 struct DeviceIdGuard(Option<String>);
@@ -32,11 +31,8 @@ use models::{CreateNotePayload, DetailedTag, Note, NoteResponse};
 // 添加评论相关模型
 use crate::models::{
     CreateCommentPayload, CreateNoteRelationPayload, NoteRelation,
-    SyncRequest, SyncResponse, DeviceHeartbeat, DeviceListResponse,
-    PushChange, PushResult, SyncConflict, DeviceState, DeviceInfo,
 };
 use crate::models::{Todo, TodoResponse, CreateTodoPayload, UpdateTodoPayload};
-use crate::db::DbConnection;
 
 // --- Use correct DbConnection type ---
 pub type SharedDb = Arc<Mutex<db::DbConnection>>;
@@ -215,6 +211,7 @@ pub fn mount_rocket(rocket: Rocket<Build>, db: SharedDb, todo_db: SharedTodoDb) 
     info!("  - GET    /inbox/notes/<id>");
     info!("  - PUT    /inbox/notes/<id> (format=json)");
     info!("  - DELETE /inbox/notes/<id>");
+    info!("  - PUT    /inbox/notes/<id>/restore");
     info!("  - GET    /inbox/tags");
     info!("  - GET    /inbox/tags/detailed");
     info!("  - GET    /inbox/notes/<note_id>/comments");
@@ -222,14 +219,12 @@ pub fn mount_rocket(rocket: Rocket<Build>, db: SharedDb, todo_db: SharedTodoDb) 
     info!("  - POST   /inbox/notes/<source_id>/relations/<target_id> (format=json)");
     info!("  - GET    /inbox/notes/<note_id>/relations");
     // 同步相关路由
-    info!("  - POST   /inbox/sync (format=json)");
-    info!("  - GET    /inbox/sync/devices");
-    info!("  - POST   /inbox/sync/devices/heartbeat (format=json)");
     info!("  - GET    /inbox/todos");
     info!("  - GET    /inbox/todos/<id>");
     info!("  - POST   /inbox/todos (format=json)");
     info!("  - PUT    /inbox/todos/<id> (format=json)");
     info!("  - DELETE /inbox/todos/<id>");
+    info!("  - PUT    /inbox/todos/<id>/restore");
 
     let rocket = rocket.mount(
         "/inbox",
@@ -240,6 +235,7 @@ pub fn mount_rocket(rocket: Rocket<Build>, db: SharedDb, todo_db: SharedTodoDb) 
             get_note,
             update_note,
             delete_note,
+            restore_note,
             get_tags,
             get_detailed_tags,
             // 评论和关系相关路由
@@ -247,16 +243,13 @@ pub fn mount_rocket(rocket: Rocket<Build>, db: SharedDb, todo_db: SharedTodoDb) 
             add_comment,
             create_relation,
             get_relations,
-            // 同步路由
-            sync,
-            get_sync_devices,
-            device_heartbeat,
             // Todo 路由
             get_todos,
             get_todo,
             create_todo,
             update_todo,
             delete_todo,
+            restore_todo,
             // 调试路由
             inbox_route_debug,
         ],
@@ -403,6 +396,26 @@ async fn delete_note(
     }
 }
 
+#[put("/notes/<id>/restore")]
+async fn restore_note(
+    db_state: &State<SharedDb>,
+    id: i64,
+    device_id_guard: DeviceIdGuard,
+) -> Result<Json<NoteResponse>, Status> {
+    let db_arc = db_state.inner().clone();
+    let device_id_str = device_id_guard.0;
+    let note = task::spawn_blocking(move || {
+        let mut conn_guard = db_arc.lock().map_err(|_| Status::InternalServerError)?;
+        db::restore_note_db(&mut conn_guard, id, device_id_str).map_err(handle_db_error)
+    })
+    .await
+    .map_err(handle_spawn_error)??;
+    match note {
+        Some(n) => Ok(Json(note_to_response(&n))),
+        None => Err(Status::NotFound),
+    }
+}
+
 // 修改migrate_db函数，解决借用问题
 pub async fn migrate_db(db_path: &str) -> Result<(), Status> {
     // 复制路径字符串，以便在闭包中使用
@@ -427,258 +440,6 @@ pub async fn migrate_db(db_path: &str) -> Result<(), Status> {
 }
 
 // ==================== 同步端点 ====================
-
-#[post("/sync", data = "<payload>", format = "json")]
-async fn sync(
-    db_state: &State<SharedDb>,
-    payload: Json<SyncRequest>,
-) -> Result<Json<SyncResponse>, Status> {
-    let db_arc = db_state.inner().clone();
-    let request = payload.into_inner();
-
-    let response = task::spawn_blocking(move || {
-        let mut conn = db_arc.lock().map_err(|_| Status::InternalServerError)?;
-        handle_sync(&mut conn, request).map_err(handle_db_error)
-    })
-    .await
-    .map_err(handle_spawn_error)??;
-
-    Ok(Json(response))
-}
-
-#[get("/sync/devices")]
-async fn get_sync_devices(db_state: &State<SharedDb>) -> Result<Json<DeviceListResponse>, Status> {
-    let db_arc = db_state.inner().clone();
-
-    let response = task::spawn_blocking(move || {
-        let conn = db_arc.lock().map_err(|_| Status::InternalServerError)?;
-        let devices = db::get_all_devices(&conn).map_err(handle_db_error)?;
-        let global_version = db::get_global_version(&conn).map_err(handle_db_error)?;
-        
-        let device_infos: Vec<DeviceInfo> = devices.into_iter().map(|d| {
-            DeviceInfo {
-                device_id: d.device_id,
-                name: d.name,
-                platform: d.platform,
-                last_seen_at: d.last_seen_at.to_rfc3339(),
-                last_synced_at: d.last_synced_at.map(|dt| dt.to_rfc3339()),
-                pending_changes: d.pending_changes,
-                version: d.version,
-                is_current: d.is_current,
-                status: d.status,
-            }
-        }).collect();
-        
-        Ok(DeviceListResponse {
-            devices: device_infos,
-            global_version,
-        })
-    })
-    .await
-    .map_err(handle_spawn_error)??;
-
-    Ok(Json(response))
-}
-
-#[post("/sync/devices/heartbeat", data = "<payload>", format = "json")]
-async fn device_heartbeat(
-    db_state: &State<SharedDb>,
-    payload: Json<DeviceHeartbeat>,
-) -> Result<Status, Status> {
-    let db_arc = db_state.inner().clone();
-    let heartbeat = payload.into_inner();
-
-    task::spawn_blocking(move || {
-        let mut conn = db_arc.lock().map_err(|_| Status::InternalServerError)?;
-        db::update_device_heartbeat(
-            &mut conn,
-            &heartbeat.device_id,
-            &heartbeat.name,
-            &heartbeat.platform,
-            heartbeat.pending_changes,
-            heartbeat.local_version,
-        ).map_err(handle_db_error)
-    })
-    .await
-    .map_err(handle_spawn_error)??;
-
-    Ok(Status::Ok)
-}
-
-// ==================== 同步处理逻辑 ====================
-
-fn handle_sync(conn: &mut DbConnection, request: SyncRequest) -> Result<SyncResponse, rusqlite::Error> {
-    let mut conn = conn; // 为了可变
-    
-    let device_id = &request.device_id;
-    let base_version = request.base_version;
-    let pull_limit = request.pull_limit.unwrap_or(500);
-    
-    // 1. 处理推送的变更
-    let mut push_results = Vec::new();
-    let mut conflicts = Vec::new();
-    
-    for change in request.push_changes {
-        match change {
-            PushChange::Create { local_version, note } => {
-                let created = db::create_note_db(&mut conn, note, Some(device_id.clone()))?;
-                push_results.push(PushResult::Created {
-                    local_version,
-                    server_version: created.version,
-                });
-            }
-            PushChange::Update { note_id, expected_version, local_version, fields } => {
-                // 检查版本冲突
-                let existing = db::get_note_db(&conn, note_id)?;
-                match existing {
-                    Some(note) if note.version != expected_version => {
-                        // 冲突
-                        let server_response = note_to_response(&note);
-                        let client_note = NoteResponse {
-                            id: note_id,
-                            content: fields.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                            tags: fields.get("tags").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default(),
-                            created_at: note.created_at.to_rfc3339(),
-                            updated_at: Utc::now().to_rfc3339(),
-                            version: expected_version,
-                            device_id: Some(device_id.clone()),
-                            deleted: false,
-                            synced_at: None,
-                            conflict: true,
-                        };
-                        
-                        conflicts.push(SyncConflict {
-                            note_id,
-                            server_version: note.version,
-                            client_expected_version: expected_version,
-                            server_note: server_response,
-                            client_note,
-                            common_ancestor_version: expected_version - 1, // 简化
-                        });
-                        
-                        push_results.push(PushResult::Conflict {
-                            note_id,
-                            server_version: note.version,
-                        });
-                    }
-                    Some(note) => {
-                        // 版本匹配，应用更新
-                        let mut payload = crate::models::UpdateNotePayload {
-                            content: fields.get("content").and_then(|v| v.as_str()).unwrap_or(&note.content).to_string(),
-                            tags: fields.get("tags").and_then(|v| serde_json::from_value(v.clone()).ok()),
-                        };
-                        
-                        let updated = db::update_note_db(&mut conn, note_id, payload, Some(device_id.clone()))?;
-                        push_results.push(PushResult::Updated {
-                            note_id,
-                            server_version: updated.as_ref().map(|n| n.version).unwrap_or(0),
-                        });
-                    }
-                    None => {
-                        push_results.push(PushResult::Error {
-                            local_version: Some(local_version),
-                            message: format!("Note {} not found", note_id),
-                        });
-                    }
-                }
-            }
-            PushChange::Delete { note_id, expected_version, local_version } => {
-                let existing = db::get_note_db(&conn, note_id)?;
-                match existing {
-                    Some(note) if note.version != expected_version => {
-                        // 冲突
-                        let server_response = note_to_response(&note);
-                        let client_note = NoteResponse {
-                            id: note_id,
-                            content: note.content.clone(),
-                            tags: note.tags.clone(),
-                            created_at: note.created_at.to_rfc3339(),
-                            updated_at: note.updated_at.to_rfc3339(),
-                            version: expected_version,
-                            device_id: Some(device_id.clone()),
-                            deleted: true,
-                            synced_at: None,
-                            conflict: true,
-                        };
-                        
-                        conflicts.push(SyncConflict {
-                            note_id,
-                            server_version: note.version,
-                            client_expected_version: expected_version,
-                            server_note: server_response,
-                            client_note,
-                            common_ancestor_version: expected_version - 1,
-                        });
-                        
-                        push_results.push(PushResult::Conflict {
-                            note_id,
-                            server_version: note.version,
-                        });
-                    }
-                    Some(_) => {
-                        let deleted = db::delete_note_db(&mut conn, note_id, Some(device_id.clone()))?;
-                        if deleted {
-                            push_results.push(PushResult::Deleted {
-                                note_id,
-                                server_version: expected_version + 1,
-                            });
-                        } else {
-                            push_results.push(PushResult::Error {
-                                local_version: Some(local_version),
-                                message: "Failed to delete".to_string(),
-                            });
-                        }
-                    }
-                    None => {
-                        push_results.push(PushResult::Error {
-                            local_version: Some(local_version),
-                            message: format!("Note {} not found", note_id),
-                        });
-                    }
-                }
-            }
-        }
-    }
-    
-    // 2. 拉取增量笔记
-    let pulled_notes_db = db::get_notes_since_version(&conn, base_version, pull_limit)?;
-    let pulled_notes: Vec<NoteResponse> = pulled_notes_db.iter()
-        .map(|n| {
-            let mut resp = note_to_response(n);
-            resp.conflict = conflicts.iter().any(|c| c.note_id == n.id);
-            resp
-        })
-        .collect();
-    
-    let has_more = pulled_notes_db.len() >= pull_limit as usize;
-    
-    // 3. 获取当前全局版本
-    let current_version = db::get_global_version(&conn)?;
-    
-    // 4. 更新设备同步时间
-    db::update_device_synced_at(&mut conn, device_id)?;
-    
-    // 5. 获取所有设备状态
-    let devices = db::get_all_devices(&conn)?;
-    let mut device_states = std::collections::HashMap::new();
-    for d in devices {
-        device_states.insert(d.device_id.clone(), DeviceState {
-            version: d.version,
-            last_seen: d.last_seen_at.to_rfc3339(),
-            pending: d.pending_changes,
-        });
-    }
-    
-    Ok(SyncResponse {
-        current_version,
-        pulled_notes,
-        has_more,
-        conflicts,
-        push_results,
-        device_states,
-    })
-}
-
 
 // ── Todo handlers ──────────────────────────────────────────────
 
@@ -791,4 +552,22 @@ async fn delete_todo(
     .map_err(handle_spawn_error)??;
     info!("Deleted todo #{}", todo_id);
     Ok(Status::NoContent)
+}
+
+#[put("/todos/<todo_id>/restore")]
+async fn restore_todo(
+    db_state: &State<SharedTodoDb>,
+    todo_id: i64,
+) -> Result<Json<TodoResponse>, Status> {
+    let db_arc = db_state.inner().0.clone();
+    let todo = task::spawn_blocking(move || {
+        let mut db = db_arc.lock().map_err(|_| Status::InternalServerError)?;
+        db::restore_todo_db(&mut db, todo_id).map_err(handle_db_error)
+    })
+    .await
+    .map_err(handle_spawn_error)??;
+    match todo {
+        Some(t) => Ok(Json(todo_to_response(&t))),
+        None => Err(Status::NotFound),
+    }
 }

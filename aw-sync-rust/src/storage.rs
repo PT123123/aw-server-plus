@@ -1,4 +1,4 @@
-//! 同步状态持久化（sync.db）：设备、配对码、同步日志、同步设置。
+//! 同步状态持久化（sync.db）：设备、配对码、同步日志、同步设置、冲突记录、回收站。
 //! 独立于 aw-server 主库，逻辑隔离。
 
 use std::path::Path;
@@ -8,7 +8,7 @@ use rusqlite::{params, Connection, Result};
 
 use crate::models::{
     ConflictSummary, Device, DeviceKind, DeviceSyncStats, PairCode, SyncConfig, SyncDirection,
-    SyncEventType, SyncLogEntry, SyncProtocol, SyncStatus,
+    SyncEventType, SyncLogEntry, SyncProtocol, SyncStatus, TrashEntry,
 };
 
 pub struct SyncDb {
@@ -48,6 +48,17 @@ impl SyncDb {
                 direction TEXT NOT NULL, protocol TEXT NOT NULL, peer_id TEXT,
                 event_type TEXT NOT NULL, status TEXT NOT NULL, message TEXT, data_size INTEGER);
             CREATE TABLE IF NOT EXISTS sync_config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS sync_conflicts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, device_id TEXT NOT NULL,
+                kind TEXT NOT NULL, logical_key TEXT NOT NULL,
+                local_rev TEXT, remote_rev TEXT, resolution TEXT NOT NULL,
+                archived_id INTEGER, created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS trash (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL, logical_key TEXT NOT NULL,
+                archived TEXT NOT NULL, winner_rev TEXT, reason TEXT NOT NULL,
+                source_device TEXT, archived_at TEXT NOT NULL,
+                restored INTEGER NOT NULL DEFAULT 0);
             COMMIT;",
         )?;
         // 幂等加列（老库升级）
@@ -478,10 +489,16 @@ impl SyncDb {
             |r| Ok((r.get(0)?, r.get(1)?)),
         ).ok();
 
-        // 获取待同步条数和冲突数（从设备表中读取，这些字段需要在同步时更新）
-        // 目前先返回默认值，后续可以在同步逻辑中更新
+        // 待同步/待解决冲突数：从 sync_conflicts 表统计未解决冲突
+        let pending_conflict_count: i32 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(COUNT(*),0) FROM sync_conflicts WHERE device_id=?1 AND resolution=''",
+                params![device_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as i32;
         let pending_push_count: i32 = 0;
-        let pending_conflict_count: i32 = 0;
 
         // 获取本地笔记条数（从 inbox_notes 表中统计）
         let local_note_count = self.get_local_note_count();
@@ -556,58 +573,164 @@ impl SyncDb {
             .unwrap_or(0)
     }
 
-    /// 获取设备冲突列表
+    /// 获取设备冲突列表（从 sync_conflicts 表读取；P0 起该表已真实落库）
     pub fn get_device_conflicts(&self, device_id: &str) -> Result<Vec<ConflictSummary>> {
-        // 尝试查询 sync_conflicts 表
-        let result = self.conn.prepare(
-            "SELECT note_id, note_title, detected_at, resolved, resolution 
-             FROM sync_conflicts 
-             WHERE device_id=?1 
-             ORDER BY detected_at DESC",
-        );
-
-        match result {
-            Ok(mut stmt) => {
-                let rows = stmt.query_map(params![device_id], |r| {
-                    Ok(ConflictSummary {
-                        note_id: r.get(0)?,
-                        note_title: r.get(1)?,
-                        detected_at: r.get(2)?,
-                        resolved: r.get::<_, i32>(3)? != 0,
-                        resolution: r.get(4)?,
-                    })
-                })?;
-                rows.collect()
-            }
-            Err(_) => {
-                // 表不存在，尝试从 sync_log 中提取冲突信息
-                self.get_conflicts_from_log(device_id)
-            }
-        }
-    }
-
-    /// 从同步日志中提取冲突信息
-    fn get_conflicts_from_log(&self, device_id: &str) -> Result<Vec<ConflictSummary>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, timestamp, message FROM sync_log 
-             WHERE peer_id=?1 AND event_type='conflict'
-             ORDER BY timestamp DESC LIMIT 20",
+            "SELECT id,kind,logical_key,created_at,resolution 
+             FROM sync_conflicts WHERE device_id=?1 ORDER BY created_at DESC",
         )?;
-
         let rows = stmt.query_map(params![device_id], |r| {
-            let id: i64 = r.get(0)?;
-            let timestamp: String = r.get(1)?;
-            let message: Option<String> = r.get(2)?;
-
+            let key: String = r.get(2)?;
+            let created: String = r.get(3)?;
+            let resolution: Option<String> = r.get(4)?;
+            let resolved = resolution
+                .as_deref()
+                .map(|s| !s.is_empty() && s != "unresolved")
+                .unwrap_or(false);
             Ok(ConflictSummary {
-                note_id: id,
-                note_title: message.unwrap_or_else(|| "未知冲突".to_string()),
-                detected_at: timestamp,
-                resolved: false,
-                resolution: None,
+                note_id: key.parse::<i64>().unwrap_or(0),
+                note_title: key,
+                detected_at: created,
+                resolved,
+                resolution,
             })
         })?;
-
         rows.collect()
+    }
+}
+
+// ---- 冲突记录 + 回收站（P0）----
+
+impl SyncDb {
+    /// 写入一条冲突记录。resolution：overwritten_by_remote / deleted_by_remote /
+    /// stale_remote_ignored / unresolved（人工处理中）。
+    pub fn insert_conflict(
+        &self,
+        device_id: &str,
+        kind: &str,
+        logical_key: &str,
+        local_rev: Option<&str>,
+        remote_rev: Option<&str>,
+        resolution: &str,
+        archived_id: Option<i64>,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO sync_conflicts (device_id,kind,logical_key,local_rev,remote_rev,resolution,archived_id,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                device_id,
+                kind,
+                logical_key,
+                local_rev,
+                remote_rev,
+                resolution,
+                archived_id,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// 写入一条回收站归档，返回 trash id。
+    pub fn insert_trash(&self, t: &TrashEntry) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO trash (kind,logical_key,archived,winner_rev,reason,source_device,archived_at,restored)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                t.kind,
+                t.logical_key,
+                t.archived,
+                t.winner_rev,
+                t.reason,
+                t.source_device,
+                t.archived_at,
+                t.restored as i64
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    fn row_to_trash(r: &rusqlite::Row) -> rusqlite::Result<TrashEntry> {
+        Ok(TrashEntry {
+            id: r.get(0)?,
+            kind: r.get(1)?,
+            logical_key: r.get(2)?,
+            archived: r.get(3)?,
+            winner_rev: r.get(4)?,
+            reason: r.get(5)?,
+            source_device: r.get(6)?,
+            archived_at: r.get(7)?,
+            restored: r.get::<_, i64>(8)? != 0,
+        })
+    }
+
+    /// 列出回收站；kind 为空表示全部（"note"/"todo"）。
+    pub fn list_trash(&self, kind: Option<&str>) -> Result<Vec<TrashEntry>> {
+        let sql = match kind {
+            Some(k) => {
+                "SELECT id,kind,logical_key,archived,winner_rev,reason,source_device,archived_at,restored
+                 FROM trash WHERE kind=?1 ORDER BY archived_at DESC"
+            }
+            None => {
+                "SELECT id,kind,logical_key,archived,winner_rev,reason,source_device,archived_at,restored
+                 FROM trash ORDER BY archived_at DESC"
+            }
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = if let Some(k) = kind {
+            stmt.query_map(params![k], Self::row_to_trash)?
+        } else {
+            stmt.query_map([], Self::row_to_trash)?
+        };
+        rows.collect()
+    }
+
+    pub fn get_trash(&self, id: i64) -> Result<Option<TrashEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,kind,logical_key,archived,winner_rev,reason,source_device,archived_at,restored
+             FROM trash WHERE id=?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], Self::row_to_trash)?;
+        rows.next().transpose()
+    }
+
+    /// 标记归档已恢复（restore 成功后），避免重复恢复。
+    pub fn mark_trash_restored(&self, id: i64) -> Result<bool> {
+        let n = self
+            .conn
+            .execute("UPDATE trash SET restored=1 WHERE id=?1", params![id])?;
+        Ok(n > 0)
+    }
+
+    /// 从回收站永久删除一条（手动清空 / 恢复后清理）。
+    pub fn delete_trash(&self, id: i64) -> Result<bool> {
+        let n = self
+            .conn
+            .execute("DELETE FROM trash WHERE id=?1", params![id])?;
+        Ok(n > 0)
+    }
+
+    /// 清理早于 cutoff 且未恢复的归档（默认 90 天自动清理）。
+    pub fn purge_trash_before(&self, cutoff: &str) -> Result<usize> {
+        let n = self.conn.execute(
+            "DELETE FROM trash WHERE restored=0 AND archived_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(n)
+    }
+
+    /// 未恢复归档总数（供前端角标）。
+    pub fn count_trash(&self) -> Result<i64> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM trash WHERE restored=0", [], |r| r.get(0))
+    }
+
+    /// 自动清理已恢复的归档副本（保留期结束后清理）。
+    pub fn purge_restored_before(&self, cutoff: &str) -> Result<usize> {
+        let n = self.conn.execute(
+            "DELETE FROM trash WHERE restored=1 AND archived_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(n)
     }
 }

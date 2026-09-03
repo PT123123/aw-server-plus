@@ -272,3 +272,41 @@ pub struct ConflictSummary {
     /// 解决方式（如果已解决）
     pub resolution: Option<String>,
 }
+
+/// 一次同步/导入的合并结果（P0 起由 apply_snapshot / sync_now 返回，供前端统计展示）
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ApplyResult {
+    /// 实际落库（新增 + 更新 + 删除）总数
+    pub applied: usize,
+    pub created: usize,
+    pub updated: usize,
+    /// 被忽略（重复 / 陈旧）数量
+    pub ignored: usize,
+    /// 进入回收站归档的数量
+    pub archived: usize,
+    pub deleted: usize,
+    pub conflicts: usize,
+    pub errors: Vec<String>,
+}
+
+/// 回收站条目（sync.db trash 表；冲突/删除被覆盖方的归档副本）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrashEntry {
+    pub id: i64,
+    /// 业务类型："note" | "todo"
+    pub kind: String,
+    /// 逻辑键（uuid / legacy:{id}）
+    pub logical_key: String,
+    /// 被归档行完整 JSON（可用于恢复）
+    pub archived: String,
+    /// 胜出方 rev，形如 "2026-09-03T10:00:00.000Z@device-1"
+    pub winner_rev: Option<String>,
+    /// 归档原因：overwritten_by_remote / deleted_by_remote / stale_remote_ignored
+    pub reason: String,
+    /// 来源设备（发送方 id）
+    pub source_device: Option<String>,
+    /// 归档时间（RFC3339）
+    pub archived_at: String,
+    /// 是否已恢复
+    pub restored: bool,
+}
