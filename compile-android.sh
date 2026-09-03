@@ -55,7 +55,10 @@ fi
 
 # Workaround for "error: unable to find library -lgcc"
 # See: https://stackoverflow.com/questions/68873570/how-do-i-fix-ld-error-unable-to-find-library-lgcc-when-cross-compiling-rust
-find "${ANDROID_NDK_HOME}" -name "libunwind.a" -execdir bash -c 'echo "INPUT(-lunwind)" > libgcc.a' \;
+find "${ANDROID_NDK_HOME}" -name "libunwind.a" | while read -r f; do
+    dir="$(dirname "$f")"
+    echo "INPUT(-lunwind)" > "$dir/libgcc.a"
+done
 
 for archtargetstr in \
     'arm64 aarch64-linux-android' \
@@ -161,5 +164,5 @@ for archtargetstr in \
 
     # Build aw-sync (without cli feature for Android)
     echo "Building aw-sync for $arch..."
-    cargo build -p aw-sync --target "$target" --lib --no-default-features "${release_args[@]}"
+    cargo build -p aw-sync-rust --target "$target" --lib --no-default-features "${release_args[@]}"
 done

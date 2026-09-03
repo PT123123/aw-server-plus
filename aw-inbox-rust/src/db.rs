@@ -526,7 +526,7 @@ fn map_row_to_relation(row: &Row) -> Result<NoteRelation, Error> {
     })
 }
 
-// 获取指向特定笔记的所有关系
+// 获取特定笔记的所有关系（无论作为 source 还是 target）
 pub fn get_relations_for_note_db(
     conn: &DbConnection,
     note_id: i64,
@@ -535,10 +535,11 @@ pub fn get_relations_for_note_db(
     let mut query = String::from(
         "SELECT id, source_note_id, target_note_id, relation_type, created_at 
          FROM note_relations 
-         WHERE target_note_id = ?",
+         WHERE source_note_id = ? OR target_note_id = ?",
     );
 
     let mut params_vec: Vec<Box<dyn ToSql>> = Vec::new();
+    params_vec.push(Box::new(note_id));
     params_vec.push(Box::new(note_id));
 
     let relation_type_str = match &relation_type {
