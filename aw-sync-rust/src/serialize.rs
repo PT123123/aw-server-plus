@@ -225,6 +225,138 @@ pub fn import_inbox(db_path: &Path, json: &str) -> Result<usize, String> {
     Ok(count)
 }
 
+// ---- Todo（todo.db）导出 / 导入 ----
+// 与 aw-inbox-rust migrate_todo 的 todos 表结构一一对应（含 version / device_id /
+// deleted / synced_at 四个同步元数据列）。合并策略：主键幂等 upsert，且仅当
+// 对端 updated_at 不早于本地时才覆盖（时间戳比较），否则保留本地 —— 这是
+// 与 inbox/activity 不同的「冲突感知」合并。
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TodoExport {
+    pub todos: Vec<TodoRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodoRow {
+    pub id: i64,
+    pub title: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub completed: i64,
+    #[serde(default)]
+    pub priority: Option<i64>,
+    #[serde(default)]
+    pub due_date: Option<String>,
+    #[serde(default)]
+    pub tags: String,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    #[serde(default)]
+    pub version: i64,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub deleted: i64,
+    #[serde(default)]
+    pub synced_at: Option<String>,
+}
+
+/// 导出 Todo 库(todo.db)为 JSON 文本（含已软删除的行，保证删除状态可同步）
+pub fn export_todo(db_path: &Path) -> Result<String, String> {
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id,title,content,completed,priority,due_date,tags,created_at,updated_at,
+                    completed_at,version,device_id,deleted,synced_at FROM todos",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(TodoRow {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                content: r.get(2)?,
+                completed: r.get(3)?,
+                priority: r.get(4)?,
+                due_date: r.get(5)?,
+                tags: r.get(6)?,
+                created_at: r.get(7)?,
+                updated_at: r.get(8)?,
+                completed_at: r.get(9)?,
+                version: r.get(10)?,
+                device_id: r.get(11)?,
+                deleted: r.get(12)?,
+                synced_at: r.get(13)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut todos = Vec::new();
+    for row in rows {
+        todos.push(row.map_err(|e| e.to_string())?);
+    }
+    serde_json::to_string(&TodoExport { todos }).map_err(|e| e.to_string())
+}
+
+/// 把 Todo JSON 写入 todo.db：
+/// - 行不存在 → 插入；
+/// - 行存在且对端 updated_at >= 本地 → 整行覆盖（含软删除标记）；
+/// - 行存在但本地更新（本地 updated_at 更新）→ 保留本地（冲突时本地优先）。
+/// 返回应用（插入 + 更新）的行数。
+pub fn import_todo(db_path: &Path, json: &str) -> Result<usize, String> {
+    let data: TodoExport = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    // 与 aw-inbox-rust migrate_todo 保持一致的 schema（首次同步时目标库可能不存在）
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS todos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            content TEXT,
+            completed INTEGER NOT NULL DEFAULT 0,
+            priority INTEGER,
+            due_date TEXT,
+            tags TEXT DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            version INTEGER NOT NULL DEFAULT 1,
+            device_id TEXT,
+            deleted INTEGER NOT NULL DEFAULT 0,
+            synced_at TEXT);",
+    )
+    .map_err(|e| format!("ensure todo schema failed: {e}"))?;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let mut applied = 0usize;
+    for t in &data.todos {
+        let changed = tx
+            .execute(
+                "INSERT INTO todos (id,title,content,completed,priority,due_date,tags,
+                                    created_at,updated_at,completed_at,version,device_id,deleted,synced_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+                 ON CONFLICT(id) DO UPDATE SET
+                    title=excluded.title, content=excluded.content,
+                    completed=excluded.completed, priority=excluded.priority,
+                    due_date=excluded.due_date, tags=excluded.tags,
+                    created_at=excluded.created_at, updated_at=excluded.updated_at,
+                    completed_at=excluded.completed_at, version=excluded.version,
+                    device_id=excluded.device_id, deleted=excluded.deleted,
+                    synced_at=excluded.synced_at
+                 WHERE excluded.updated_at >= todos.updated_at",
+                rusqlite::params![
+                    t.id, t.title, t.content, t.completed, t.priority, t.due_date, t.tags,
+                    t.created_at, t.updated_at, t.completed_at, t.version, t.device_id,
+                    t.deleted, t.synced_at
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        applied += changed;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(applied)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

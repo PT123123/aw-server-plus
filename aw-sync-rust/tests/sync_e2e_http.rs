@@ -192,6 +192,7 @@ fn two_machines_pair_and_sync_end_to_end() {
         source_device: Some(serde_json::from_value::<Device>(dev_b.clone()).unwrap()),
         activity: None,
         inbox: Some(inbox_json_b),
+        todo: None,
     };
     let push_resp: serde_json::Value = c
         .post(format!("{}/api/0/sync/push", ba))
@@ -216,6 +217,7 @@ fn two_machines_pair_and_sync_end_to_end() {
         source_device: Some(serde_json::from_value::<Device>(info_a).unwrap()),
         activity: None,
         inbox: Some(inbox_json_a),
+        todo: None,
     };
     let target_b: Device = serde_json::from_value(dev_b.clone()).unwrap();
     let applied = aw_sync_rust::transport::push_snapshot(&target_b, &snap_a).unwrap();

@@ -124,6 +124,7 @@ mod tests {
             port: 56001,
             paired_at: chrono::Utc::now(),
             last_sync_at: None,
+        last_seen_at: None,
                         is_online: true,
             is_self: false,
             paired: false,

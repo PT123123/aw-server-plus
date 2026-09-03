@@ -181,9 +181,12 @@ pub struct SyncConfig {
     pub listen_port: u16,
     /// UDP 广播/发现固定端口（五位数，默认 46000）
     pub udp_port: u16,
-    /// 同步目标：inbox.db / sqlite.db
+    /// 同步目标：inbox.db / sqlite.db / todo.db
     pub sync_inbox: bool,
     pub sync_activity: bool,
+    /// 是否同步 Todo 数据（todo.db）
+    #[serde(default = "default_sync_todo")]
+    pub sync_todo: bool,
     /// 本机别名（广播时随载荷发送；空则使用主机名）
     #[serde(default)]
     pub self_alias: String,
@@ -201,13 +204,19 @@ impl Default for SyncConfig {
             udp_port: 46000,
             sync_inbox: true,
             sync_activity: true,
+            sync_todo: true,
             self_alias: String::new(),
             probe_interval: 10,
         }
     }
 }
 
-/// 同步载荷快照：读取目标库（sqlite.db + inbox.db）后序列化而成，经 JSON 传输。
+/// sync_todo 的 serde 默认值：老数据库的配置 JSON 没有该字段，默认开启。
+fn default_sync_todo() -> bool {
+    true
+}
+
+/// 同步载荷快照：读取目标库（sqlite.db + inbox.db + todo.db）后序列化而成，经 JSON 传输。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SyncSnapshot {
     /// 发送方设备信息
@@ -216,6 +225,9 @@ pub struct SyncSnapshot {
     pub activity: Option<String>,
     /// Inbox 数据（notes/tags/comments 的 JSON 文本）
     pub inbox: Option<String>,
+    /// Todo 数据（todos 表的 JSON 文本）
+    #[serde(default)]
+    pub todo: Option<String>,
 }
 
 /// 设备同步统计信息

@@ -536,7 +536,80 @@ async fn push(state: &State<SharedManager>, snap: Json<SyncSnapshot>) -> Res {
             )),
             data_size: Some(
                 snap.activity.as_ref().map_or(0, |s| s.len() as u64)
-                    + snap.inbox.as_ref().map_or(0, |s| s.len() as u64),
+                    + snap.inbox.as_ref().map_or(0, |s| s.len() as u64)
+                    + snap.todo.as_ref().map_or(0, |s| s.len() as u64),
+            ),
+        });
+        Ok(serde_json::json!({ "applied": applied }))
+    })
+    .await
+}
+
+// ---- WiFi 热点传输（实验性）：快照导出 / 拉取合并 ----
+// 由扫码方（传送方）在本机与对端之间中转数据：
+//   1. GET  /snapshot：导出本机快照（含 source_device）；
+//   2. POST /apply  ：把「从对端拉来的快照」合并进本机（与 /push 复用同一 apply_snapshot）。
+
+#[get("/snapshot")]
+async fn snapshot(state: &State<SharedManager>) -> Res {
+    run(state, |m| {
+        let mut snap = SyncSnapshot {
+            source_device: Some(m.self_device_info()),
+            ..Default::default()
+        };
+        m.export(&mut snap);
+        Ok(serde_json::to_value(snap).unwrap_or(serde_json::Value::Null))
+    })
+    .await
+}
+
+#[post("/apply", data = "<snap>", format = "json")]
+async fn apply(state: &State<SharedManager>, snap: Json<SyncSnapshot>) -> Res {
+    let snap = snap.into_inner();
+    run(state, move |m| {
+        let applied = m.apply_snapshot(&snap)?;
+        let peer = snap.source_device.clone().unwrap_or_else(|| Device {
+            id: String::new(),
+            name: "未知设备".into(),
+            device_kind: crate::models::DeviceKind::Unknown,
+            ip: String::new(),
+            port: 0,
+            paired_at: Utc::now(),
+            last_sync_at: None,
+            last_seen_at: None,
+            is_online: false,
+            is_self: false,
+            paired: false,
+            alias: None,
+        });
+        // 若对端尚未在信任列表，自动加入
+        if !peer.id.is_empty() {
+            if let Ok(existing) = m.get_device(&peer.id) {
+                if existing.is_none() {
+                    let _ = m.save_device(&peer);
+                }
+            }
+        }
+        crate::dbglog::info(format!("[wifi] /apply 处理完成: 应用记录数 {}", applied));
+        let _ = m.add_log(&SyncLogEntry {
+            id: None,
+            timestamp: chrono::Utc::now(),
+            direction: SyncDirection::In,
+            protocol: SyncProtocol::Http,
+            peer_id: Some(peer.id.clone()),
+            event_type: SyncEventType::Sync,
+            status: SyncStatus::Success,
+            message: Some(format!(
+                "WiFi 传输：本机({}) 已合并来自 {}({}) 的数据，应用记录数: {}",
+                m.self_id(),
+                peer.name,
+                peer.id,
+                applied
+            )),
+            data_size: Some(
+                snap.activity.as_ref().map_or(0, |s| s.len() as u64)
+                    + snap.inbox.as_ref().map_or(0, |s| s.len() as u64)
+                    + snap.todo.as_ref().map_or(0, |s| s.len() as u64),
             ),
         });
         Ok(serde_json::json!({ "applied": applied }))
@@ -608,7 +681,7 @@ pub fn mount_rocket(rocket: Rocket<Build>, mgr: SharedManager) -> Rocket<Build> 
                 devices, add_device,
                 sync_now, device_delete, device_alias, devices_clear_all,
                 device_stats, device_conflicts,
-                logs, log_clear, push, debug_log, status
+                logs, log_clear, push, apply, snapshot, debug_log, status
             ],
         )
 }

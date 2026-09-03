@@ -23,7 +23,7 @@ use crate::models::{
 
 use crate::paircode::{PairError, PairingManager};
 
-use crate::serialize::{export_activity, export_inbox, import_activity, import_inbox};
+use crate::serialize::{export_activity, export_inbox, export_todo, import_activity, import_inbox, import_todo};
 
 use crate::storage::{LogFilter, SyncDb};
 
@@ -251,25 +251,19 @@ impl SyncManager {
     /// 组装本机数据快照（按配置决定是否含 activity / inbox）。
 
     pub fn export(&self, sn: &mut SyncSnapshot) {
-
         let cfg = self.get_config();
-
         if cfg.sync_activity {
-
             let p = self.data_dir.join("sqlite.db");
-
             sn.activity = export_activity(p.as_path()).ok();
-
         }
-
         if cfg.sync_inbox {
-
             let p = self.data_dir.join("inbox.db");
-
             sn.inbox = export_inbox(p.as_path()).ok();
-
         }
-
+        if cfg.sync_todo {
+            let p = self.data_dir.join("todo.db");
+            sn.todo = export_todo(p.as_path()).ok();
+        }
     }
 
 
@@ -307,6 +301,14 @@ impl SyncManager {
         if let Some(inbox) = &snap.inbox {
 
             applied += import_inbox(self.data_dir.join("inbox.db").as_path(), inbox)
+
+                .unwrap_or(0);
+
+        }
+
+        if let Some(todo) = &snap.todo {
+
+            applied += import_todo(self.data_dir.join("todo.db").as_path(), todo)
 
                 .unwrap_or(0);
 
@@ -356,7 +358,9 @@ impl SyncManager {
 
             .map_or(0, |s| s.len() as u64)
 
-            + snap.inbox.as_ref().map_or(0, |s| s.len() as u64);
+            + snap.inbox.as_ref().map_or(0, |s| s.len() as u64)
+
+            + snap.todo.as_ref().map_or(0, |s| s.len() as u64);
 
         self.add_log(&SyncLogEntry {
             id: None,
