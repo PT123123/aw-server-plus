@@ -165,6 +165,7 @@ pub fn broadcast_loop(info: SelfInfo, udp_port: u16, interval: Duration) {
                         device.ip, device.port, device.id, udp_port
                     )),
                     data_size: Some(payload.len() as u64),
+                    details: None,
                 });
             }
         }
@@ -249,6 +250,7 @@ pub fn listener_loop(db: SharedDb, udp_port: u16, self_id: String) {
                                 dev.name, dev.ip, dev.port, dev.id
                             )),
                             data_size: None,
+                            details: None,
                         };
                         db.add_log(&entry)
                             .map_err(|e| crate::dbglog::error(format!("[discovery] add_log failed: {}", e)))

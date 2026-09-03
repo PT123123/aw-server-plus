@@ -142,6 +142,7 @@ async fn join(state: &State<SharedManager>, req: Json<JoinRequest>) -> JoinResul
                         status: SyncStatus::Success,
                         message: Some(format!("已与设备配对: {}", dev.name)),
                         data_size: None,
+                        details: None,
                     });
                     crate::dbglog::info(format!(
                         "[pair] /join 成功: 已登记 {}({}), 并返回本机信息给对方",
@@ -284,6 +285,7 @@ async fn pair_confirm(state: &State<SharedManager>, dev: Json<Device>) -> Res {
             status: SyncStatus::Success,
             message: Some(format!("收到来自 {} 的配对确认", peer.name)),
             data_size: None,
+            details: None,
         };
         m.add_log(&log_entry)
             .map_err(|e| crate::dbglog::error(format!("[pair] add_log failed: {}", e)))
@@ -347,6 +349,7 @@ async fn device_delete(state: &State<SharedManager>, id: String) -> Res {
             status: SyncStatus::Success,
             message: Some(format!("已删除设备 {id}")),
             data_size: None,
+            details: None,
         });
         Ok(serde_json::json!({ "deleted": removed }))
     })
@@ -368,6 +371,7 @@ async fn devices_clear_all(state: &State<SharedManager>) -> Res {
             status: SyncStatus::Success,
             message: Some(format!("已清空所有配对信息（移除 {cleared} 台设备）")),
             data_size: None,
+            details: None,
         });
         Ok(serde_json::json!({ "cleared": cleared }))
     })
@@ -402,6 +406,7 @@ async fn device_alias(state: &State<SharedManager>, id: String, body: Json<Alias
             status: SyncStatus::Success,
             message: Some(msg),
             data_size: None,
+        details: None,
         });
         Ok(serde_json::json!({ "updated": true, "id": id }))
     })
@@ -519,6 +524,7 @@ async fn push(state: &State<SharedManager>, snap: Json<SyncSnapshot>) -> Res {
                 }
             }
         }
+        let details = if applied.records.is_empty() { None } else { Some(applied.records.clone()) };
         let _ = m.add_log(&SyncLogEntry {
             id: None,
             timestamp: chrono::Utc::now(),
@@ -539,6 +545,7 @@ async fn push(state: &State<SharedManager>, snap: Json<SyncSnapshot>) -> Res {
                     + snap.inbox.as_ref().map_or(0, |s| s.len() as u64)
                     + snap.todo.as_ref().map_or(0, |s| s.len() as u64),
             ),
+            details,
         });
         Ok(serde_json::json!({ "applied": applied.applied, "result": applied }))
     })
@@ -591,6 +598,7 @@ async fn apply(state: &State<SharedManager>, snap: Json<SyncSnapshot>) -> Res {
             }
         }
         crate::dbglog::info(format!("[wifi] /apply 处理完成: 应用记录数 {}", applied.applied));
+        let details = if applied.records.is_empty() { None } else { Some(applied.records.clone()) };
         let _ = m.add_log(&SyncLogEntry {
             id: None,
             timestamp: chrono::Utc::now(),
@@ -611,6 +619,7 @@ async fn apply(state: &State<SharedManager>, snap: Json<SyncSnapshot>) -> Res {
                     + snap.inbox.as_ref().map_or(0, |s| s.len() as u64)
                     + snap.todo.as_ref().map_or(0, |s| s.len() as u64),
             ),
+            details,
         });
         Ok(serde_json::json!({ "applied": applied.applied, "result": applied }))
     })

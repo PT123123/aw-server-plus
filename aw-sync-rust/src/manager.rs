@@ -317,6 +317,7 @@ impl SyncManager {
                     src, result.archived
                 )),
                 data_size: None,
+                details: None,
             });
         }
         crate::dbglog::info(format!(
@@ -382,6 +383,7 @@ impl SyncManager {
                 applied.archived
             )),
             data_size: Some(size),
+            details: if applied.records.is_empty() { None } else { Some(applied.records.clone()) },
         })?;
 
         Ok(applied)
@@ -425,6 +427,7 @@ impl SyncManager {
             status: SyncStatus::Success,
             message: Some(detail.clone()),
             data_size: Some(payload.len() as u64),
+        details: None,
         }) {
             Ok(id) => log::info!("[aw-sync] initiate_pair: add_log 成功, id={}", id),
             Err(e) => log::error!("[aw-sync] initiate_pair: add_log 失败: {}", e),
@@ -459,6 +462,7 @@ impl SyncManager {
                 self.self_id, name, from.id, from.ip, from.port
             )),
             data_size: None,
+            details: None,
         };
         self.add_log(&log_entry)
 .map_err(|e| crate::dbglog::error(format!("[pair] add_log failed: {}", e)))
@@ -491,6 +495,7 @@ impl SyncManager {
                 self.self_id, peer.name, peer.id, url, payload
             )),
             data_size: Some(payload.len() as u64),
+            details: None,
         }).ok();
         let resp = crate::transport::confirm_pair(&peer, &me)?;
         self.mark_paired(peer_id, true)?;
@@ -757,6 +762,7 @@ impl SyncManager {
                     entry.kind, entry.logical_key
                 )),
                 data_size: None,
+                details: None,
             });
         }
         Ok(ok)
@@ -1102,6 +1108,7 @@ fn persist_outcome(
     result.conflicts += out.archived.len();
     result.archived += out.archived.len();
     result.errors.extend(out.errors);
+    result.records.extend(out.records);
 
     for ar in out.archived {
         let trash = TrashEntry {

@@ -16,6 +16,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::conflict;
+use crate::models::TransferRecord;
 
 /// 一条被归档的记录（冲突 / 删除导致被覆盖或忽略的旧版本，交由上层写入回收站表）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,11 +43,44 @@ pub struct ImportOutcome {
     pub ignored_dup: usize,
     pub archived: Vec<ArchivedRecord>,
     pub errors: Vec<String>,
+    /// 逐条传输明细（P1 起，供前端「同步详情」展示）
+    pub records: Vec<TransferRecord>,
 }
 
 impl ImportOutcome {
     pub fn applied(&self) -> usize {
         self.created + self.updated + self.deleted
+    }
+}
+
+/// 截断字符串到 max_chars 个字符（用于 title 字段）。
+fn truncate_title(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        s.chars().take(max_chars).collect::<String>() + "…"
+    }
+}
+
+/// 从 NoteRow 构建一条传输明细。
+fn transfer_from_note(n: &NoteRow, action: &str, reason: Option<&str>) -> TransferRecord {
+    TransferRecord {
+        kind: "note".into(),
+        logical_key: logical_key(&n.uuid, n.id),
+        title: truncate_title(&n.content, 40),
+        action: action.into(),
+        reason: reason.map(|s| s.to_string()),
+    }
+}
+
+/// 从 TodoRow 构建一条传输明细。
+fn transfer_from_todo(t: &TodoRow, action: &str, reason: Option<&str>) -> TransferRecord {
+    TransferRecord {
+        kind: "todo".into(),
+        logical_key: logical_key(&t.uuid, t.id),
+        title: truncate_title(&t.title, 40),
+        action: action.into(),
+        reason: reason.map(|s| s.to_string()),
     }
 }
 
@@ -404,6 +438,7 @@ pub fn import_inbox(db_path: &Path, json: &str) -> Result<ImportOutcome, String>
                     ln.content == n.content && ln.tags == n.tags && ln.deleted == n.deleted;
                 if same {
                     out.ignored_dup += 1;
+                    out.records.push(transfer_from_note(n, "ignored_dup", None));
                     continue;
                 }
                 let newer = conflict::incoming_newer(
@@ -442,8 +477,10 @@ pub fn import_inbox(db_path: &Path, json: &str) -> Result<ImportOutcome, String>
                     .map_err(|e| e.to_string())?;
                     if n.deleted != 0 {
                         out.deleted += 1;
+                        out.records.push(transfer_from_note(n, "deleted", Some("deleted_by_remote")));
                     } else {
                         out.updated += 1;
+                        out.records.push(transfer_from_note(n, "updated", Some("overwritten_by_remote")));
                     }
                 } else {
                     out.archived.push(ArchivedRecord {
@@ -454,6 +491,7 @@ pub fn import_inbox(db_path: &Path, json: &str) -> Result<ImportOutcome, String>
                         reason: "stale_remote_ignored".into(),
                     });
                     out.ignored_stale += 1;
+                    out.records.push(transfer_from_note(n, "ignored_stale", Some("stale_remote_ignored")));
                 }
             }
             None => {
@@ -474,6 +512,7 @@ pub fn import_inbox(db_path: &Path, json: &str) -> Result<ImportOutcome, String>
                 )
                 .map_err(|e| e.to_string())?;
                 out.created += 1;
+                out.records.push(transfer_from_note(n, "created", None));
             }
         }
     }
@@ -587,6 +626,7 @@ pub fn import_todo(db_path: &Path, json: &str) -> Result<ImportOutcome, String> 
                     && lt.tags == t.tags;
                 if same {
                     out.ignored_dup += 1;
+                    out.records.push(transfer_from_todo(t, "ignored_dup", None));
                     continue;
                 }
                 let newer = conflict::incoming_newer(
@@ -631,8 +671,10 @@ pub fn import_todo(db_path: &Path, json: &str) -> Result<ImportOutcome, String> 
                     .map_err(|e| e.to_string())?;
                     if t.deleted != 0 {
                         out.deleted += 1;
+                        out.records.push(transfer_from_todo(t, "deleted", Some("deleted_by_remote")));
                     } else {
                         out.updated += 1;
+                        out.records.push(transfer_from_todo(t, "updated", Some("overwritten_by_remote")));
                     }
                 } else {
                     out.archived.push(ArchivedRecord {
@@ -643,6 +685,7 @@ pub fn import_todo(db_path: &Path, json: &str) -> Result<ImportOutcome, String> 
                         reason: "stale_remote_ignored".into(),
                     });
                     out.ignored_stale += 1;
+                    out.records.push(transfer_from_todo(t, "ignored_stale", Some("stale_remote_ignored")));
                 }
             }
             None => {
@@ -669,6 +712,7 @@ pub fn import_todo(db_path: &Path, json: &str) -> Result<ImportOutcome, String> 
                 )
                 .map_err(|e| e.to_string())?;
                 out.created += 1;
+                out.records.push(transfer_from_todo(t, "created", None));
             }
         }
     }
@@ -767,6 +811,13 @@ pub fn import_activity(db_path: &Path, json: &str) -> Result<ImportOutcome, Stri
             )
             .map_err(|e| e.to_string())?;
             out.updated += 1;
+            out.records.push(TransferRecord {
+                kind: "bucket".into(),
+                logical_key: b.name.clone(),
+                title: truncate_title(&b.name, 40),
+                action: "updated".into(),
+                reason: None,
+            });
         } else {
             tx.execute(
                 "INSERT INTO buckets (name,type,client,hostname,created) VALUES (?1,?2,?3,?4,?5)",
@@ -776,6 +827,13 @@ pub fn import_activity(db_path: &Path, json: &str) -> Result<ImportOutcome, Stri
             let bid = tx.last_insert_rowid();
             bucket_ids.insert(b.name.clone(), bid);
             out.created += 1;
+            out.records.push(TransferRecord {
+                kind: "bucket".into(),
+                logical_key: b.name.clone(),
+                title: truncate_title(&b.name, 40),
+                action: "created".into(),
+                reason: None,
+            });
         }
     }
 
@@ -784,8 +842,16 @@ pub fn import_activity(db_path: &Path, json: &str) -> Result<ImportOutcome, Stri
         let fp = event_fingerprint(&e.bucket_name, e.timestamp, e.duration, &e.data);
         if local_fp.contains(&fp) {
             out.ignored_dup += 1;
+            out.records.push(TransferRecord {
+                kind: "event".into(),
+                logical_key: fp.clone(),
+                title: format!("{} @ {}", e.bucket_name, e.timestamp),
+                action: "ignored_dup".into(),
+                reason: None,
+            });
             continue;
         }
+        let fp_clone = fp.clone();
         match bucket_ids.get(&e.bucket_name) {
             Some(bid) => {
                 tx.execute(
@@ -793,8 +859,15 @@ pub fn import_activity(db_path: &Path, json: &str) -> Result<ImportOutcome, Stri
                     rusqlite::params![bid, e.timestamp, e.timestamp + e.duration, e.data],
                 )
                 .map_err(|e| e.to_string())?;
-                local_fp.insert(fp);
+                local_fp.insert(fp_clone);
                 out.created += 1;
+                out.records.push(TransferRecord {
+                    kind: "event".into(),
+                    logical_key: fp.clone(),
+                    title: format!("{} @ {}", e.bucket_name, e.timestamp),
+                    action: "created".into(),
+                    reason: None,
+                });
             }
             None => out
                 .errors

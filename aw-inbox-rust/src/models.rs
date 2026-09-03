@@ -158,3 +158,44 @@ pub struct UpdateTodoPayload {
     pub due_date: Option<DateTime<Utc>>,
     pub tags: Option<Vec<String>>,
 }
+
+// ── Note History ───────────────────────────────────────────────
+
+/// 数据库内部的笔记历史快照
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NoteHistory {
+    pub id: i64,
+    pub note_id: i64,
+    pub content: String,
+    pub tags: Vec<String>,
+    pub version: i64,
+    pub device_id: Option<String>,
+    pub updated_at: DateTime<Utc>,
+    pub snapshot_at: DateTime<Utc>,
+}
+
+/// API 响应结构（时间字段序列化为字符串，与 NoteResponse 风格一致）
+#[derive(Serialize, Debug)]
+pub struct NoteHistoryResponse {
+    pub id: i64,
+    pub note_id: i64,
+    pub content: String,
+    pub tags: Vec<String>,
+    pub version: i64,
+    pub device_id: Option<String>,
+    pub updated_at: String,
+    pub snapshot_at: String,
+}
+
+pub fn note_history_to_response(h: &NoteHistory) -> NoteHistoryResponse {
+    NoteHistoryResponse {
+        id: h.id,
+        note_id: h.note_id,
+        content: h.content.clone(),
+        tags: h.tags.clone(),
+        version: h.version,
+        device_id: h.device_id.clone(),
+        updated_at: h.updated_at.to_rfc3339(),
+        snapshot_at: h.snapshot_at.to_rfc3339(),
+    }
+}

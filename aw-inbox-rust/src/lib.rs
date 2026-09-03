@@ -26,13 +26,11 @@ impl<'r> FromRequest<'r> for DeviceIdGuard {
 pub mod db;
 mod models;
 // Ensure models.rs has correct Note/NoteResponse definitions (tags: Vec<String>)
-use crate::models::UpdateNotePayload;
-use models::{CreateNotePayload, DetailedTag, Note, NoteResponse};
-// 添加评论相关模型
 use crate::models::{
-    CreateCommentPayload, CreateNoteRelationPayload, NoteRelation,
+    CreateCommentPayload, CreateNotePayload, CreateNoteRelationPayload, CreateTodoPayload,
+    DetailedTag, Note, NoteHistoryResponse, NoteRelation, NoteResponse, Todo, TodoResponse,
+    UpdateNotePayload, UpdateTodoPayload, note_history_to_response,
 };
-use crate::models::{Todo, TodoResponse, CreateTodoPayload, UpdateTodoPayload};
 
 // --- Use correct DbConnection type ---
 pub type SharedDb = Arc<Mutex<db::DbConnection>>;
@@ -197,6 +195,23 @@ async fn get_relations(
     Ok(Json(relations))
 }
 
+#[get("/notes/<note_id>/history")]
+async fn get_note_history(
+    db_state: &State<SharedDb>,
+    note_id: i64,
+) -> Result<Json<Vec<NoteHistoryResponse>>, Status> {
+    let db_arc = db_state.inner().clone();
+
+    let history = task::spawn_blocking(move || {
+        let conn = db_arc.lock().map_err(|_| Status::InternalServerError)?;
+        db::get_note_history_db(&conn, note_id).map_err(handle_db_error)
+    })
+    .await
+    .map_err(handle_spawn_error)??;
+
+    Ok(Json(history.iter().map(note_history_to_response).collect()))
+}
+
 // mount_rocket remains the same
 pub fn mount_rocket(rocket: Rocket<Build>, db: SharedDb, todo_db: SharedTodoDb) -> Rocket<Build> {
     info!("开始注册 Inbox Server 路由...");
@@ -218,6 +233,7 @@ pub fn mount_rocket(rocket: Rocket<Build>, db: SharedDb, todo_db: SharedTodoDb) 
     info!("  - POST   /inbox/notes/<note_id>/comments (format=json)");
     info!("  - POST   /inbox/notes/<source_id>/relations/<target_id> (format=json)");
     info!("  - GET    /inbox/notes/<note_id>/relations");
+    info!("  - GET    /inbox/notes/<note_id>/history");
     // 同步相关路由
     info!("  - GET    /inbox/todos");
     info!("  - GET    /inbox/todos/<id>");
@@ -243,6 +259,8 @@ pub fn mount_rocket(rocket: Rocket<Build>, db: SharedDb, todo_db: SharedTodoDb) 
             add_comment,
             create_relation,
             get_relations,
+            // 历史版本路由
+            get_note_history,
             // Todo 路由
             get_todos,
             get_todo,

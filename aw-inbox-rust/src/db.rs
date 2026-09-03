@@ -159,6 +159,25 @@ pub fn migrate(conn: &DbConnection) -> Result<(), Error> {
         "#,
     )?;
 
+    // 笔记历史快照表（纯本地，不参与跨网同步）
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS note_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            note_id INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            tags TEXT DEFAULT '[]',
+            version INTEGER NOT NULL,
+            device_id TEXT,
+            updated_at TEXT NOT NULL,
+            snapshot_at TEXT NOT NULL,
+            FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_note_history_note_id ON note_history(note_id);
+        CREATE INDEX IF NOT EXISTS idx_note_history_snapshot_at ON note_history(snapshot_at);
+        "#,
+    )?;
+
     info!("✅ 数据库迁移完成");
     Ok(())
 }
@@ -398,6 +417,17 @@ pub fn update_note_db(
         |row| row.get(0),
     )?;
 
+    // 修改前：把当前版本快照写入历史（本地保留，不同步）
+    tx.execute(
+        r#"
+        INSERT INTO note_history (note_id, content, tags, version, device_id, updated_at, snapshot_at)
+        SELECT id, content, tags, version, device_id, updated_at, ?1
+        FROM notes
+        WHERE id = ?2
+        "#,
+        params![updated_at, note_id],
+    )?;
+
     let rows_affected = tx.execute(
         r#"
         UPDATE notes
@@ -416,6 +446,45 @@ pub fn update_note_db(
     }
 }
 
+/// 查询某条笔记的全部历史快照（按快照时间倒序，最新在前）
+pub fn get_note_history_db(
+    conn: &DbConnection,
+    note_id: i64,
+) -> Result<Vec<crate::models::NoteHistory>, Error> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, note_id, content, tags, version, device_id, updated_at, snapshot_at
+        FROM note_history
+        WHERE note_id = ?1
+        ORDER BY snapshot_at DESC, id DESC
+        "#,
+    )?;
+
+    let iter = stmt.query_map(params![note_id], |row| {
+        let tags_json: String = row.get("tags")?;
+        let tags: Vec<String> = serde_json::from_str(&tags_json).map_err(map_serde_error)?;
+        let updated_at: DateTime<Utc> = row.get("updated_at")?;
+        let snapshot_at: DateTime<Utc> = row.get("snapshot_at")?;
+
+        Ok(crate::models::NoteHistory {
+            id: row.get("id")?,
+            note_id: row.get("note_id")?,
+            content: row.get("content")?,
+            tags,
+            version: row.get("version")?,
+            device_id: row.get("device_id")?,
+            updated_at,
+            snapshot_at,
+        })
+    })?;
+
+    let mut results = Vec::new();
+    for r in iter {
+        results.push(r?);
+    }
+    Ok(results)
+}
+
 pub fn delete_note_db(conn: &mut DbConnection, note_id: i64, device_id: Option<String>) -> Result<bool, Error> {
     let updated_at = Utc::now();
     
@@ -426,6 +495,17 @@ pub fn delete_note_db(conn: &mut DbConnection, note_id: i64, device_id: Option<S
         "UPDATE sync_versions SET global_version = global_version + 1 RETURNING global_version",
         [],
         |row| row.get(0),
+    )?;
+
+    // 删除前：把当前版本快照写入历史（本地保留，不同步）
+    tx.execute(
+        r#"
+        INSERT INTO note_history (note_id, content, tags, version, device_id, updated_at, snapshot_at)
+        SELECT id, content, tags, version, device_id, updated_at, ?1
+        FROM notes
+        WHERE id = ?2
+        "#,
+        params![updated_at, note_id],
     )?;
 
     let rows_affected = tx.execute(

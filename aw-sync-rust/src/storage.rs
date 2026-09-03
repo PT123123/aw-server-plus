@@ -46,7 +46,8 @@ impl SyncDb {
             CREATE TABLE IF NOT EXISTS sync_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL,
                 direction TEXT NOT NULL, protocol TEXT NOT NULL, peer_id TEXT,
-                event_type TEXT NOT NULL, status TEXT NOT NULL, message TEXT, data_size INTEGER);
+                event_type TEXT NOT NULL, status TEXT NOT NULL, message TEXT, data_size INTEGER,
+                details TEXT);
             CREATE TABLE IF NOT EXISTS sync_config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS sync_conflicts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, device_id TEXT NOT NULL,
@@ -65,6 +66,7 @@ impl SyncDb {
         self.ensure_column("devices", "paired", "ALTER TABLE devices ADD COLUMN paired INTEGER NOT NULL DEFAULT 0");
         self.ensure_column("devices", "alias", "ALTER TABLE devices ADD COLUMN alias TEXT");
         self.ensure_column("devices", "last_seen_at", "ALTER TABLE devices ADD COLUMN last_seen_at TEXT");
+        self.ensure_column("sync_log", "details", "ALTER TABLE sync_log ADD COLUMN details TEXT");
         Ok(())
     }
 
@@ -246,13 +248,14 @@ impl SyncDb {
     // ---- Sync log ----
 
     pub fn add_log(&self, e: &SyncLogEntry) -> Result<i64> {
+        let details_json = e.details.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default());
         self.conn.execute(
-            "INSERT INTO sync_log (timestamp,direction,protocol,peer_id,event_type,status,message,data_size)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT INTO sync_log (timestamp,direction,protocol,peer_id,event_type,status,message,data_size,details)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 e.timestamp.to_rfc3339(), e.direction.as_str(), e.protocol.as_str(),
                 e.peer_id, e.event_type.as_str(), e.status.as_str(), e.message,
-                e.data_size.map(|s| s as i64),
+                e.data_size.map(|s| s as i64), details_json,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -278,6 +281,8 @@ impl SyncDb {
         sql.push_str(" ORDER BY id DESC LIMIT ?1 OFFSET ?2");
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![f.limit.max(1) as i64, f.offset as i64], |r| {
+            let details_str: Option<String> = r.get(9)?;
+            let details = details_str.and_then(|s| serde_json::from_str::<Vec<crate::models::TransferRecord>>(&s).ok());
             Ok(SyncLogEntry {
                 id: Some(r.get(0)?),
                 timestamp: parse_dt(&r.get::<_, String>(1)?),
@@ -288,6 +293,7 @@ impl SyncDb {
                 status: parse_status(&r.get::<_, String>(6)?),
                 message: r.get(7)?,
                 data_size: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+                details,
             })
         })?;
         rows.collect()

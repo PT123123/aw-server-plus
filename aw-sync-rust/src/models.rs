@@ -154,6 +154,17 @@ impl PairCode {
     }
 }
 
+/// 一条传输明细：某次同步中单条记录的操作结果（供前端「同步详情」逐条展示）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferRecord {
+    pub kind: String,
+    pub logical_key: String,
+    pub title: String,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// 一条同步日志（方向/协议/事件/状态/消息）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncLogEntry {
@@ -166,6 +177,8 @@ pub struct SyncLogEntry {
     pub status: SyncStatus,
     pub message: Option<String>,
     pub data_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Vec<TransferRecord>>,
 }
 
 /// 局域网同步设置
@@ -287,6 +300,9 @@ pub struct ApplyResult {
     pub deleted: usize,
     pub conflicts: usize,
     pub errors: Vec<String>,
+    /// 逐条传输明细（P1 起，供前端「同步详情」展示）
+    #[serde(default)]
+    pub records: Vec<TransferRecord>,
 }
 
 /// 回收站条目（sync.db trash 表；冲突/删除被覆盖方的归档副本）
