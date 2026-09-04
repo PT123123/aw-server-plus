@@ -502,9 +502,10 @@ pub mod android {
                 Ok(mgr) => {
                     if let Ok(g) = mgr.lock() {
                         let _ = g.spawn_discovery();
+                        let _ = g.spawn_d1_sync();
                     }
                     rocket = aw_sync_rust::endpoints::mount_rocket(rocket, mgr);
-                    info!("[AW_SYNC] 局域网同步路由已挂载 (aw-sync-rust)");
+                    info!("[AW_SYNC] 局域网同步 + D1 云同步路由已挂载 (aw-sync-rust)");
                 }
                 Err(e) => error!("[AW_SYNC] 局域网同步挂载失败(服务器继续启动): {e}"),
             }
