@@ -344,6 +344,22 @@ impl SyncDb {
             if let Some(v) = map.get("probe_interval") {
                 cfg.probe_interval = v.as_u64().unwrap_or(10) as u16;
             }
+            // Cloudflare D1 云同步
+            if let Some(v) = map.get("d1_enabled") {
+                cfg.d1_enabled = v.as_bool().unwrap_or(false);
+            }
+            if let Some(v) = map.get("d1_account_id") {
+                cfg.d1_account_id = v.as_str().unwrap_or("").to_string();
+            }
+            if let Some(v) = map.get("d1_database_id") {
+                cfg.d1_database_id = v.as_str().unwrap_or("").to_string();
+            }
+            if let Some(v) = map.get("d1_api_token") {
+                cfg.d1_api_token = v.as_str().unwrap_or("").to_string();
+            }
+            if let Some(v) = map.get("d1_sync_interval") {
+                cfg.d1_sync_interval = v.as_i64().unwrap_or(300);
+            }
         }
         cfg
     }
@@ -380,6 +396,12 @@ impl SyncDb {
             ("sync_activity", cfg.sync_activity.to_string()),
             ("self_alias", cfg.self_alias.clone()),
             ("probe_interval", cfg.probe_interval.to_string()),
+            // Cloudflare D1 云同步
+            ("d1_enabled", cfg.d1_enabled.to_string()),
+            ("d1_account_id", cfg.d1_account_id.clone()),
+            ("d1_database_id", cfg.d1_database_id.clone()),
+            ("d1_api_token", cfg.d1_api_token.clone()),
+            ("d1_sync_interval", cfg.d1_sync_interval.to_string()),
         ];
         let tx = self.conn.unchecked_transaction()?;
         for (k, v) in entries {
@@ -390,6 +412,30 @@ impl SyncDb {
             )?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    // ---- D1 同步时间戳 ----
+
+    /// 读取最近一次 D1 同步成功的时间戳（RFC3339），未同步过返回 None。
+    pub fn get_d1_last_sync(&self) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT value FROM sync_config WHERE key='d1_last_sync'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+    }
+
+    /// 写入 D1 同步成功的时间戳。
+    pub fn set_d1_last_sync(&self, ts: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO sync_config (key,value) VALUES ('d1_last_sync', ?1)",
+                params![ts],
+            )
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 }

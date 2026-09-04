@@ -19,6 +19,7 @@ pub mod discovery;
 pub mod manager;
 pub mod dbglog;
 pub mod endpoints;
+pub mod d1_sync;
 
 pub use manager::SyncManager;
 /// 由 Android（Java）侧注入 Wi-Fi 链路真实 IP（绕过 VPN 隧道）时使用。

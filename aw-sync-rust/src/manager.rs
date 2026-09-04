@@ -552,6 +552,78 @@ impl SyncManager {
 
 
 
+    /// D1 云同步后台线程：按配置间隔定期触发 D1 双向同步。
+    /// 进程内用原子标志保证只启动一次,返回值恒为（空线程句柄或实际句柄）。
+    pub fn spawn_d1_sync(&self) -> std::thread::JoinHandle<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static D1_SYNC_STARTED: AtomicBool = AtomicBool::new(false);
+
+        if D1_SYNC_STARTED.swap(true, Ordering::SeqCst) {
+            return std::thread::spawn(|| {});
+        }
+
+        let data_dir = self.data_dir.clone();
+        let self_id = self.self_id.clone();
+
+        std::thread::Builder::new()
+            .name("aw-sync-d1".into())
+            .spawn(move || loop {
+                let (enabled, interval_secs) = {
+                    if let Ok(db) = SyncDb::open(&data_dir) {
+                        let cfg = db.get_config();
+                        (cfg.d1_enabled, cfg.d1_sync_interval.max(10) as u64)
+                    } else {
+                        (false, 300)
+                    }
+                };
+
+                if enabled {
+                    let cfg = SyncDb::open(&data_dir)
+                        .map(|db| db.get_config())
+                        .unwrap_or_default();
+                    if cfg.d1_account_id.trim().is_empty()
+                        || cfg.d1_database_id.trim().is_empty()
+                        || cfg.d1_api_token.trim().is_empty()
+                    {
+                        crate::dbglog::warn(
+                            "[d1] D1 未配置完整，跳过本次自动同步".to_string(),
+                        );
+                    } else {
+                        crate::dbglog::info(
+                            "[d1] 后台自动同步触发...".to_string(),
+                        );
+                        match crate::d1_sync::d1_sync_now(&data_dir, &self_id, &cfg) {
+                            Ok(result) => {
+                                crate::dbglog::info(format!(
+                                    "[d1] 后台同步完成: ok={}, pushed={}n/{}t, pulled={}n/{}t, conflicts={}, errors={}",
+                                    result.ok,
+                                    result.pushed_notes,
+                                    result.pushed_todos,
+                                    result.pulled_notes,
+                                    result.pulled_todos,
+                                    result.conflicts,
+                                    result.errors.len()
+                                ));
+                                if result.ok {
+                                    let now = Utc::now().to_rfc3339();
+                                    if let Ok(db) = SyncDb::open(&data_dir) {
+                                        let _ = db.set_d1_last_sync(&now);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                crate::dbglog::error(format!("[d1] 后台同步失败: {e}"));
+                            }
+                        }
+                    }
+                }
+
+                std::thread::sleep(std::time::Duration::from_secs(interval_secs));
+            })
+            .unwrap_or_else(|_| std::thread::spawn(|| {}))
+    }
+
     /// 在线探测线程：遍历所有已配对设备,按配置间隔探测其在线状态并更新 is_online。
 
     /// 进程内用原子标志保证只启动一次,返回值恒为（空线程句柄或实际句柄）。
@@ -776,6 +848,34 @@ impl SyncManager {
     /// 未恢复归档总数（供前端角标）。
     pub fn trash_count(&self) -> Result<i64, String> {
         self.db().count_trash().map_err(|e| e.to_string())
+    }
+
+    // ---- Cloudflare D1 云同步 ----
+
+    /// 测试 D1 连接。
+    pub fn d1_test(&self) -> Result<crate::d1_sync::D1TestResult, String> {
+        let cfg = self.get_config();
+        crate::d1_sync::d1_test(&cfg)
+    }
+
+    /// 获取 D1 同步状态。
+    pub fn d1_status(&self) -> Result<crate::d1_sync::D1Status, String> {
+        let cfg = self.get_config();
+        let last_sync = self.db().get_d1_last_sync();
+        Ok(crate::d1_sync::d1_status(&cfg, last_sync))
+    }
+
+    /// 触发一次 D1 双向同步。成功后更新 d1_last_sync 时间戳。
+    pub fn d1_sync_now(&self) -> Result<crate::d1_sync::D1SyncResult, String> {
+        let cfg = self.get_config();
+        let result = crate::d1_sync::d1_sync_now(&self.data_dir, &self.self_id, &cfg)?;
+        if result.ok {
+            let now = Utc::now().to_rfc3339();
+            if let Err(e) = self.db().set_d1_last_sync(&now) {
+                crate::dbglog::warn(format!("[d1] 更新 d1_last_sync 失败: {e}"));
+            }
+        }
+        Ok(result)
     }
 
     /// 本机 Device（用于展示与广播）。

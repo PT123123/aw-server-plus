@@ -15,6 +15,35 @@ use crate::models::{
 use crate::storage::LogFilter;
 use chrono::Utc;
 
+// ---- Cloudflare D1 云同步 ----
+
+#[post("/d1/test")]
+async fn d1_test(state: &State<SharedManager>) -> Res {
+    run(state, |m| {
+        let result = m.d1_test()?;
+        Ok(serde_json::to_value(result).unwrap_or(serde_json::Value::Null))
+    })
+    .await
+}
+
+#[get("/d1/status")]
+async fn d1_status(state: &State<SharedManager>) -> Res {
+    run(state, |m| {
+        let result = m.d1_status()?;
+        Ok(serde_json::to_value(result).unwrap_or(serde_json::Value::Null))
+    })
+    .await
+}
+
+#[post("/d1/sync")]
+async fn d1_sync_now(state: &State<SharedManager>) -> Res {
+    run(state, |m| {
+        let result = m.d1_sync_now()?;
+        Ok(serde_json::to_value(result).unwrap_or(serde_json::Value::Null))
+    })
+    .await
+}
+
 type Res = Result<Json<serde_json::Value>, Status>;
 
 /// 在阻塞线程中执行同步管理器操作，统一返回 Json<Value>。
@@ -742,7 +771,8 @@ pub fn mount_rocket(rocket: Rocket<Build>, mgr: SharedManager) -> Rocket<Build> 
                 sync_now, device_delete, device_alias, devices_clear_all,
                 device_stats, device_conflicts,
                 logs, log_clear, push, apply, snapshot, debug_log, status,
-                trash_list, trash_restore, trash_delete, trash_clear_all
+                trash_list, trash_restore, trash_delete, trash_clear_all,
+                d1_test, d1_status, d1_sync_now
             ],
         )
 }

@@ -205,6 +205,24 @@ pub struct SyncConfig {
     pub self_alias: String,
     /// 在线状态探测间隔（秒），用于已配对设备的心跳探测
     pub probe_interval: u16,
+
+    // ---- Cloudflare D1 云同步 ----
+
+    /// D1 云同步总开关
+    #[serde(default)]
+    pub d1_enabled: bool,
+    /// Cloudflare Account ID
+    #[serde(default)]
+    pub d1_account_id: String,
+    /// D1 Database ID
+    #[serde(default)]
+    pub d1_database_id: String,
+    /// D1 API Token（Bearer <REDACTED>）
+    #[serde(default)]
+    pub d1_api_token: String,
+    /// D1 自动同步间隔（秒），默认 300
+    #[serde(default = "default_d1_sync_interval")]
+    pub d1_sync_interval: i64,
 }
 
 impl Default for SyncConfig {
@@ -220,8 +238,18 @@ impl Default for SyncConfig {
             sync_todo: true,
             self_alias: String::new(),
             probe_interval: 10,
+            d1_enabled: false,
+            d1_account_id: String::new(),
+            d1_database_id: String::new(),
+            d1_api_token: String::new(),
+            d1_sync_interval: 300,
         }
     }
+}
+
+/// d1_sync_interval 的 serde 默认值：老数据库的配置 JSON 没有该字段，默认 300 秒。
+fn default_d1_sync_interval() -> i64 {
+    300
 }
 
 /// sync_todo 的 serde 默认值：老数据库的配置 JSON 没有该字段，默认开启。
