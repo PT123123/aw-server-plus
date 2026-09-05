@@ -10,18 +10,135 @@
 //! 请求体: { "sql": "...", "params": [...] }
 //! 响应: { "success": true, "results": [...], "meta": {...} }
 
+use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use log::info;
 use reqwest::blocking::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::models::SyncConfig;
 use crate::serialize::{
     ImportOutcome, InboxExport, NoteRow, RelationRow, TodoExport, TodoRow,
     export_inbox, export_todo, import_inbox, import_todo,
 };
+
+// ---------------------------------------------------------------------------
+// DNS 韧性层（自 128c659 合并回，按平台限定作用域）
+//
+// 全平台：getaddrinfo 重试×3 + 60s 进程级缓存 —— DNS 抖动/污染两端都受益。
+// 仅 Android（cfg）：强制 IPv4 + Cloudflare anycast 兜底池 + TCP 探测。
+//   部分安卓设备的 IPv6 路径到 Cloudflare 不稳定（TCP 握手后 "error sending
+//   request"），且设备 DNS 间歇性返回 EAI_NODATA；桌面网络环境没有这些问题，
+//   且直连 IP 探测可能被防火墙/代理策略拦截（661c478 之前桌面翻车的根因），
+//   因此只在 Android 上启用。
+// ---------------------------------------------------------------------------
+
+/// 上次探测成功的 IPv4（进程级缓存），60 秒内复用，避开抖动的 DNS。
+/// TTL 短：网络抖动时缓存的地址可能很快失效，宁可重探测。
+fn last_good_v4() -> &'static Mutex<Option<(Instant, SocketAddr)>> {
+    static CACHE: OnceLock<Mutex<Option<(Instant, SocketAddr)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Cloudflare anycast IPv4 兜底池：DNS 失败/结果不可用时参与候选
+/// （anycast 边缘节点长期稳定；1.1.1.1 不在此列——部分网络对其单独阻断 TCP）。
+#[cfg(target_os = "android")]
+const CF_FALLBACK_V4: &[&str] = &[
+    "104.19.193.29",
+    "104.19.192.175",
+    "104.19.192.29",
+    "198.41.200.13",
+    "172.64.32.115",
+];
+
+/// 把域名解析到 IPv4 地址。如果彻底失败返回 None（调用方回退到系统默认解析）。
+fn resolve_ipv4(host: &str) -> Option<SocketAddr> {
+    // 0) 命中 60 秒内的缓存直接用
+    if let Some((at, addr)) = *last_good_v4().lock().unwrap() {
+        if at.elapsed() < Duration::from_secs(60) {
+            crate::dbglog::info(format!("[d1] resolve_ipv4({host}) cache hit = {addr}"));
+            return Some(addr);
+        }
+    }
+
+    // 1) getaddrinfo 重试 3 次，过滤 A 记录（设备 DNS 间歇性 EAI_NODATA）
+    let mut v4: Vec<SocketAddr> = Vec::new();
+    for attempt in 0..3u32 {
+        match std::net::ToSocketAddrs::to_socket_addrs(&(host, 443)) {
+            Ok(iter) => {
+                v4 = iter.filter(|a| a.is_ipv4()).collect();
+                if !v4.is_empty() {
+                    crate::dbglog::info(format!(
+                        "[d1] resolve_ipv4({host}) dns attempt {attempt} ok, v4={v4:?}"
+                    ));
+                    break;
+                }
+                crate::dbglog::info(format!(
+                    "[d1] resolve_ipv4({host}) dns attempt {attempt}: no A record"
+                ));
+            }
+            Err(e) => {
+                crate::dbglog::info(format!(
+                    "[d1] resolve_ipv4({host}) dns attempt {attempt} failed: {e}"
+                ));
+            }
+        }
+        if attempt < 2 {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+    if v4.is_empty() {
+        return None;
+    }
+
+    // 2) 仅 Android：合并 anycast 兜底池（去重）+ TCP 探测选路。
+    //    桌面直接返回首个 DNS 结果，不做直连 IP 探测。
+    #[cfg(target_os = "android")]
+    {
+        if host == "api.cloudflare.com" {
+            for s in CF_FALLBACK_V4 {
+                // 注意：只能按 Ipv4Addr 解析再拼端口 443；直接 parse::<SocketAddr>()
+                // 要求 "ip:port" 格式，裸 IP 会静默失败导致兜底失效
+                if let Ok(ip) = s.parse::<std::net::Ipv4Addr>() {
+                    let addr = SocketAddr::new(std::net::IpAddr::V4(ip), 443);
+                    if !v4.contains(&addr) {
+                        v4.push(addr);
+                    }
+                }
+            }
+        }
+
+        // 带超时的 TCP 探测（2s），选一个真正能通的 IPv4。
+        // 注意不能用无超时的 TcpStream::connect((host, 443))：getaddrinfo 可能先
+        // 返回 IPv6 地址，在 IPv6 黑洞的设备上探测本身会挂起 ~2 分钟。
+        for a in &v4 {
+            match std::net::TcpStream::connect_timeout(a, Duration::from_secs(2)) {
+                Ok(_) => {
+                    *last_good_v4().lock().unwrap() = Some((Instant::now(), *a));
+                    return Some(*a);
+                }
+                Err(e) => crate::dbglog::info(format!("[d1] probe {a} failed: {e}")),
+            }
+        }
+        // 探测全失败也可能只是瞬时丢包：返回第一个候选让 reqwest 自己再试
+        // （有 15s 连接超时 + 30s 总超时兜底），同时清掉可能过期的缓存。
+        *last_good_v4().lock().unwrap() = None;
+        crate::dbglog::info(format!("[d1] resolve_ipv4({host}) 全部探测失败，返回首个候选",));
+        return v4.first().copied();
+    }
+
+    // 非 Android：DNS 重试已够，缓存首个 A 记录后返回
+    #[cfg(not(target_os = "android"))]
+    {
+        *last_good_v4().lock().unwrap() = Some((Instant::now(), v4[0]));
+        Some(v4[0])
+    }
+}
 
 /// D1 云同步客户端
 #[derive(Clone)]
@@ -85,9 +202,10 @@ pub struct D1Error {
     pub message: Option<String>,
 }
 
-/// D1 同步结果
-#[derive(Debug, Default)]
+/// D1 同步结果（供 endpoints.rs 序列化返回给前端）
+#[derive(Debug, Default, Serialize)]
 pub struct D1SyncResult {
+    pub ok: bool,
     pub pushed_notes: usize,
     pub pushed_todos: usize,
     pub pulled_notes: usize,
@@ -96,18 +214,70 @@ pub struct D1SyncResult {
     pub errors: Vec<String>,
 }
 
+/// D1 连接测试结果（前端「测试连接」按钮）
+#[derive(Debug, Serialize)]
+pub struct D1TestResult {
+    pub ok: bool,
+    pub message: String,
+}
+
+/// D1 同步状态（前端状态页展示）
+#[derive(Debug, Serialize)]
+pub struct D1Status {
+    pub enabled: bool,
+    pub configured: bool,
+    pub last_sync: Option<String>,
+}
+
 impl D1Client {
     /// 创建 D1 客户端
     pub fn new(account_id: String, database_id: String, api_token: String, device_id: String) -> Result<Self, String> {
-        let http = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+        if account_id.trim().is_empty() {
+            return Err("D1 Account ID 为空".to_string());
+        }
+        if database_id.trim().is_empty() {
+            return Err("D1 Database ID 为空".to_string());
+        }
+        if api_token.trim().is_empty() {
+            return Err("D1 API Token 为空".to_string());
+        }
+        let base = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(15));
+
+        // 全平台：用 resolve_ipv4() 预解析（带 DNS 重试 + 60s 缓存）并绑定结果。
+        // 仅 Android：叠加 anycast 兜底/TCP 探测（在 resolve_ipv4 内部）+ 强制本地
+        // IPv4 绑定——即使对端固定到 IPv4，socket 仍可能绑定到 IPv6 wildcard
+        // [::]:0（双栈设备默认），导致内核走 IPv6 路由；显式绑定 0.0.0.0:0 确保
+        // socket 族为 AF_INET。桌面不做这些（直连 IP 探测在部分桌面网络会被拦截）。
+        #[cfg(target_os = "android")]
+        let base = match resolve_ipv4("api.cloudflare.com") {
+            Some(addr) => {
+                crate::dbglog::info(format!("[d1] 强制 IPv4: api.cloudflare.com -> {addr}"));
+                base.resolve("api.cloudflare.com", addr).local_address(Some(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                ))
+            }
+            None => base,
+        };
+
+        #[cfg(not(target_os = "android"))]
+        let base = match resolve_ipv4("api.cloudflare.com") {
+            Some(addr) => {
+                crate::dbglog::info(format!("[d1] 预解析: api.cloudflare.com -> {addr}"));
+                base.resolve("api.cloudflare.com", addr)
+            }
+            None => base,
+        };
+
+        let http = base
             .build()
             .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))?;
         Ok(Self {
             http,
-            account_id,
-            database_id,
-            api_token,
+            account_id: account_id.trim().to_string(),
+            database_id: database_id.trim().to_string(),
+            api_token: api_token.trim().to_string(),
             device_id,
         })
     }
@@ -146,14 +316,35 @@ impl D1Client {
         self.query(sql)
     }
 
+    /// 把 reqwest 错误的整条 source 链拼成可读字符串（连接超时/TLS/DNS 各是一层）。
+    fn error_chain(e: &reqwest::Error) -> String {
+        let mut msg = format!("{e}");
+        let mut src: Option<&dyn std::error::Error> = std::error::Error::source(e);
+        while let Some(s) = src {
+            msg.push_str(&format!(" <- {s}"));
+            src = s.source();
+        }
+        msg
+    }
+
     fn do_request(&self, url: &str, body: Value) -> Result<D1Response, String> {
+        let started = Instant::now();
         let resp = self.http
             .post(url)
             .header("Authorization", format!("Bearer {}", self.api_token))
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
-            .map_err(|e| format!("D1 请求失败: {e}"))?;
+            .map_err(|e| {
+                crate::dbglog::info(format!(
+                    "[d1] send() 失败 (耗时 {:.1}s): {}",
+                    started.elapsed().as_secs_f32(),
+                    Self::error_chain(&e)
+                ));
+                // 请求失败时清掉进程级 DNS 缓存，下次同步重新探测选路
+                *last_good_v4().lock().unwrap() = None;
+                format!("D1 请求失败: {}", Self::error_chain(&e))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -172,13 +363,23 @@ impl D1Client {
     }
 
     fn do_raw_request(&self, url: &str, body: Value) -> Result<D1RawResponse, String> {
+        let started = Instant::now();
         let resp = self.http
             .post(url)
             .header("Authorization", format!("Bearer {}", self.api_token))
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
-            .map_err(|e| format!("D1 请求失败: {e}"))?;
+            .map_err(|e| {
+                crate::dbglog::info(format!(
+                    "[d1] raw send() 失败 (耗时 {:.1}s): {}",
+                    started.elapsed().as_secs_f32(),
+                    Self::error_chain(&e)
+                ));
+                // 请求失败时清掉进程级 DNS 缓存，下次同步重新探测选路
+                *last_good_v4().lock().unwrap() = None;
+                format!("D1 请求失败: {}", Self::error_chain(&e))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -509,6 +710,7 @@ pub fn sync_d1(
     let conflicts = inbox_outcome.archived.len() + todo_outcome.archived.len();
 
     Ok(D1SyncResult {
+        ok: true,
         pushed_notes,
         pushed_todos,
         pulled_notes: inbox_outcome.created + inbox_outcome.updated + inbox_outcome.deleted,
@@ -516,6 +718,91 @@ pub fn sync_d1(
         conflicts,
         errors: Vec::new(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// 公共 API（manager.rs / endpoints.rs 消费）
+// ---------------------------------------------------------------------------
+
+/// 测试 D1 连接（前端「测试连接」按钮）。每次尝试都新建客户端（重新解析/选路）。
+pub fn d1_test(cfg: &SyncConfig) -> Result<D1TestResult, String> {
+    crate::dbglog::info(format!(
+        "[d1] d1_test() 被调用, account={}, db={}, token_len={}",
+        cfg.d1_account_id, cfg.d1_database_id, cfg.d1_api_token.len()
+    ));
+    if cfg.d1_account_id.trim().is_empty()
+        || cfg.d1_database_id.trim().is_empty()
+        || cfg.d1_api_token.trim().is_empty()
+    {
+        return Ok(D1TestResult {
+            ok: false,
+            message: "请填写 Account ID / Database ID / API Token".to_string(),
+        });
+    }
+    // 网络抖动时给第二次机会
+    let attempt = || {
+        D1Client::new(
+            cfg.d1_account_id.trim().to_string(),
+            cfg.d1_database_id.trim().to_string(),
+            cfg.d1_api_token.trim().to_string(),
+            "connectivity-test".to_string(),
+        )
+        .and_then(|client| {
+            client
+                .query("SELECT 1")
+                .map(|_| ())
+                .map_err(|e| format!("D1 查询失败: {e}"))
+        })
+    };
+    match attempt().or_else(|_| attempt()) {
+        Ok(()) => {
+            crate::dbglog::info("[d1] d1_test() 连接成功".to_string());
+            Ok(D1TestResult {
+                ok: true,
+                message: "D1 连接成功".to_string(),
+            })
+        }
+        Err(e) => Ok(D1TestResult {
+            ok: false,
+            message: format!("连接失败: {e}"),
+        }),
+    }
+}
+
+/// 获取 D1 同步状态（前端状态页刷新）。
+pub fn d1_status(cfg: &SyncConfig, last_sync: Option<String>) -> D1Status {
+    D1Status {
+        enabled: cfg.d1_enabled,
+        configured: !cfg.d1_account_id.trim().is_empty()
+            && !cfg.d1_database_id.trim().is_empty()
+            && !cfg.d1_api_token.trim().is_empty(),
+        last_sync,
+    }
+}
+
+/// 触发一次 D1 双向同步（manager 自动同步 + 前端「立即同步」共用入口）。
+pub fn d1_sync_now(
+    data_dir: &Path,
+    self_id: &str,
+    cfg: &SyncConfig,
+) -> Result<D1SyncResult, String> {
+    let result = sync_d1(
+        data_dir,
+        &cfg.d1_account_id,
+        &cfg.d1_database_id,
+        &cfg.d1_api_token,
+        self_id,
+    )?;
+    crate::dbglog::info(format!(
+        "[d1] 同步完成: ok={}, pushed={}n/{}t, pulled={}n/{}t, conflicts={}",
+        result.ok,
+        result.pushed_notes,
+        result.pushed_todos,
+        result.pulled_notes,
+        result.pulled_todos,
+        result.conflicts
+    ));
+    Ok(result)
 }
 
 #[cfg(test)]

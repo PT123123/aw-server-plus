@@ -19,7 +19,10 @@ uuid = { version = "1.3", features = ["serde", "v4"] }
 rand = "0.8"
 gethostname = "0.4"
 libc = "0.2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "native-tls"] }
+# rustls + webpki-roots：内置根证书，不依赖系统 CA 存储/openssl 交叉编译。
+# 两端统一：Android 走 openssl 交叉编译不可靠（ef16c71 当年为此换的 rustls），
+# 桌面 Windows 的 Schannel/native-tls 并无必要。
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls-webpki-roots"] }
 rocket = { version = "0.5.1", features = ["json"] }
 rocket_cors = "0.6.0"
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
