@@ -335,6 +335,15 @@ impl SyncManager {
     /// 立即与某设备执行一次「拉-合-推」双向同步。
     /// 1) 拉取对端快照 → 2) 本地合并（冲突自动仲裁、被覆盖方进回收站）→ 3) 导出本地推给对端。
     pub fn sync_to(&self, peer_id: &str) -> Result<ApplyResult, String> {
+        self.sync_to_opts(peer_id, true)
+    }
+
+    /// 自动同步用的静默变体：无任何实际变更时不写成功日志，避免周期任务刷屏。
+    pub fn sync_to_quiet(&self, peer_id: &str) -> Result<ApplyResult, String> {
+        self.sync_to_opts(peer_id, false)
+    }
+
+    fn sync_to_opts(&self, peer_id: &str, log_noop: bool) -> Result<ApplyResult, String> {
         let peer = self.get_device(peer_id)?.ok_or("未找到目标设备")?;
 
         // 1) 拉取对端快照
@@ -362,29 +371,33 @@ impl SyncManager {
             + snap.inbox.as_ref().map_or(0, |s| s.len() as u64)
             + snap.todo.as_ref().map_or(0, |s| s.len() as u64);
 
-        self.add_log(&SyncLogEntry {
-            id: None,
-            timestamp: Utc::now(),
-            direction: SyncDirection::Out,
-            protocol: SyncProtocol::Http,
-            peer_id: Some(peer.id.clone()),
-            event_type: SyncEventType::Sync,
-            status: SyncStatus::Success,
-            message: Some(format!(
-                "本机({}) 与 {}({}) 双向同步完成: 拉取应用 {} 条(新增{} 更新{} 删除{})，推送 {} 条，归档 {} 条",
-                self.self_id,
-                peer.name,
-                peer.id,
-                applied.applied,
-                applied.created,
-                applied.updated,
-                applied.deleted,
-                pushed,
-                applied.archived
-            )),
-            data_size: Some(size),
-            details: if applied.records.is_empty() { None } else { Some(applied.records.clone()) },
-        })?;
+        // 无实际变更且为周期自动同步时跳过成功日志（静默模式，避免刷爆同步报文）
+        let noop = applied.applied == 0 && pushed == 0 && applied.archived == 0;
+        if log_noop || !noop {
+            self.add_log(&SyncLogEntry {
+                id: None,
+                timestamp: Utc::now(),
+                direction: SyncDirection::Out,
+                protocol: SyncProtocol::Http,
+                peer_id: Some(peer.id.clone()),
+                event_type: SyncEventType::Sync,
+                status: SyncStatus::Success,
+                message: Some(format!(
+                    "本机({}) 与 {}({}) 双向同步完成: 拉取应用 {} 条(新增{} 更新{} 删除{})，推送 {} 条，归档 {} 条",
+                    self.self_id,
+                    peer.name,
+                    peer.id,
+                    applied.applied,
+                    applied.created,
+                    applied.updated,
+                    applied.deleted,
+                    pushed,
+                    applied.archived
+                )),
+                data_size: Some(size),
+                details: if applied.records.is_empty() { None } else { Some(applied.records.clone()) },
+            })?;
+        }
 
         Ok(applied)
     }
@@ -645,6 +658,98 @@ impl SyncManager {
             .unwrap_or_else(|_| std::thread::spawn(|| {}))
     }
 
+    /// 局域网自动同步后台线程：enabled 时按 sync_interval 周期对所有已配对设备
+    /// 执行「拉-合-推」双向同步（与手动同步共用 sync_to）。
+    /// 与 spawn_d1_sync 同模式：进程内只启动一次、常驻循环、每轮重读配置。
+    /// 因需调用 sync_to（&self 方法），此处以 SharedManager 为参而非 &self。
+    /// 三档模式即 sync_interval 的预设：狂暴 10 / 平和 300 / 静默 1800（秒）。
+    pub fn spawn_auto_sync(mgr: &SharedManager) -> std::thread::JoinHandle<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static AUTO_SYNC_STARTED: AtomicBool = AtomicBool::new(false);
+
+        if AUTO_SYNC_STARTED.swap(true, Ordering::SeqCst) {
+            return std::thread::spawn(|| {});
+        }
+
+        let data_dir = match mgr.lock() {
+            Ok(g) => g.data_dir.clone(),
+            Err(_) => return std::thread::spawn(|| {}),
+        };
+        let mgr = Arc::clone(mgr);
+
+        std::thread::Builder::new()
+            .name("aw-sync-auto".into())
+            .spawn(move || {
+                let mut prev_enabled = false;
+                loop {
+                    let (enabled, interval_secs) = match SyncDb::open(&data_dir) {
+                        Ok(db) => {
+                            let cfg = db.get_config();
+                            (cfg.enabled, cfg.sync_interval.max(5))
+                        }
+                        Err(_) => (false, 10u64),
+                    };
+
+                    if enabled {
+                        // 关→开（如刚连上 Wi-Fi 自动开启）：不管在线状态立即尝试一轮
+                        let force = !prev_enabled;
+                        if force {
+                            crate::dbglog::info(
+                                "[auto] 局域网同步已开启，立即同步一轮".to_string(),
+                            );
+                        }
+                        if let Ok(db) = SyncDb::open(&data_dir) {
+                            let targets: Vec<crate::models::Device> = match db.get_devices() {
+                                Ok(devices) => devices
+                                    .into_iter()
+                                    .filter(|d| d.paired && !d.is_self && (force || d.is_online))
+                                    .collect(),
+                                Err(_) => Vec::new(),
+                            };
+                            for d in targets {
+                                // 先做轻量可达性探测（不持锁，连接 2s/读取 3s）：对端离网时
+                                // 快速跳过，避免拿住全局锁等满 HTTP 总超时、饿死其余接口
+                                if crate::transport::probe_online(&d).is_err() {
+                                    crate::dbglog::info(format!(
+                                        "[auto] 设备 {}({}) 不可达，本轮跳过同步",
+                                        d.name, d.id
+                                    ));
+                                    continue;
+                                }
+                                // try_lock：前台请求正持锁时本轮跳过，后台同步不与 UI 抢锁
+                                match mgr.try_lock() {
+                                    Ok(g) => {
+                                        if let Err(e) = g.sync_to_quiet(&d.id) {
+                                            crate::dbglog::warn(format!(
+                                                "[auto] 与设备 {}({}) 自动同步失败: {e}",
+                                                d.name, d.id
+                                            ));
+                                        }
+                                    }
+                                    Err(_) => {
+                                        crate::dbglog::info(
+                                            "[auto] 同步锁被占用（前台请求优先），本轮跳过".to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    prev_enabled = enabled;
+
+                    // 5 秒步进睡眠：修改频率配置后最迟 5 秒生效
+                    let mut waited = 0u64;
+                    while waited < interval_secs {
+                        let step = 5u64.min(interval_secs - waited);
+                        std::thread::sleep(std::time::Duration::from_secs(step));
+                        waited += step;
+                    }
+                }
+            })
+            .unwrap_or_else(|_| std::thread::spawn(|| {}))
+    }
+
     /// 在线探测线程：遍历所有已配对设备,按配置间隔探测其在线状态并更新 is_online。
 
     /// 进程内用原子标志保证只启动一次,返回值恒为（空线程句柄或实际句柄）。
@@ -668,6 +773,21 @@ impl SyncManager {
             .name("aw-sync-probe".into())
 
             .spawn(move || loop {
+
+                // 未开启时空转：enabled 由 Android 侧按 Wi-Fi 状态自动驱动
+                let lan_enabled = SyncDb::open(&data_dir)
+
+                    .map(|db| db.get_config().enabled)
+
+                    .unwrap_or(false);
+
+                if !lan_enabled {
+
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+
+                    continue;
+
+                }
 
                 if let Ok(db) = SyncDb::open(&data_dir) {
 
@@ -716,31 +836,64 @@ impl SyncManager {
 
 
 
-    /// 根据当前配置启动后台发现（广播宣告 + 监听并入信任列表）。
-
-    /// 返回已启动的线程句柄。配置关闭或为非 broadcast 模式时不启动。
-
-    /// 进程内只允许成功启动一次,避免用户反复保存设置导致线程累积。
-
+    /// 兼容入口（桌面启动 / install_sync）：确保发现线程已拉起；配置开启时立即开始广播。
+    /// Android 端改用 start_discovery / stop_discovery（由「进入/离开局域网同步界面」驱动）。
     pub fn spawn_discovery(&self) -> Vec<std::thread::JoinHandle<()>> {
 
-        if discovery_running() {
-
-            return Vec::new();
-
-        }
+        self.ensure_discovery_threads();
 
         let cfg = self.get_config();
 
-        if !cfg.enabled || cfg.discovery_method != "broadcast" {
+        if cfg.enabled && cfg.discovery_method == "broadcast" {
 
-            return Vec::new();
+            set_discovery_active(true);
 
         }
 
-        set_discovery_running(true);
+        Vec::new()
 
-        let mut handles = Vec::new();
+    }
+
+
+
+    /// 进入「局域网同步」界面：开始广播宣告与监听处理。
+    /// 线程进程内常驻（只拉起一次），实际收发由 DISCOVERY_ACTIVE 开关逐轮控制。
+
+    pub fn start_discovery(&self) {
+
+        self.ensure_discovery_threads();
+
+        set_discovery_active(true);
+
+    }
+
+
+
+    /// 离开「局域网同步」界面：停止广播与监听处理（不进入界面绝不广播）。
+
+    pub fn stop_discovery(&self) {
+
+        set_discovery_active(false);
+
+    }
+
+
+
+    fn ensure_discovery_threads(&self) {
+
+        let cfg = self.get_config();
+
+        if cfg.discovery_method != "broadcast" {
+
+            return;
+
+        }
+
+        if DISCOVERY_THREADS_STARTED.swap(true, Ordering::SeqCst) {
+
+            return;
+
+        }
 
         let udp = cfg.udp_port;
 
@@ -748,13 +901,13 @@ impl SyncManager {
 
 
 
-        // 周期广播自己的信息
+        // 周期广播自己的信息（循环内每轮检查 discovery_active，并重解析本机 IP）
 
         let dev = self_device.clone();
 
         let data_dir = self.data_dir.clone();
 
-        if let Ok(h) = std::thread::Builder::new()
+        let _ = std::thread::Builder::new()
 
             .name("aw-sync-announce".into())
 
@@ -770,13 +923,7 @@ impl SyncManager {
 
                 )
 
-            })
-
-        {
-
-            handles.push(h);
-
-        }
+            });
 
 
 
@@ -786,19 +933,11 @@ impl SyncManager {
 
         let sid = self_device.id.clone();
 
-        if let Ok(h) = std::thread::Builder::new()
+        let _ = std::thread::Builder::new()
 
             .name("aw-sync-listen".into())
 
-            .spawn(move || discovery::listener_loop(db, udp, sid))
-
-        {
-
-            handles.push(h);
-
-        }
-
-        handles
+            .spawn(move || discovery::listener_loop(db, udp, sid));
 
     }
 
@@ -1003,7 +1142,7 @@ impl SyncManager {
 
             // IP 优先用 Android 侧注入的 Wi-Fi 真地址（绕过 VPN），
             // 否则退回枚举网卡结果；都拿不到则留空（前端提示未获取到，广播跳过）。
-            ip: local_ip_override().or_else(local_ip).unwrap_or_default(),
+            ip: current_local_ip(),
 
             port: cfg.listen_port,
 
@@ -1123,6 +1262,12 @@ pub fn local_ip_iface() -> Option<String> {
     let guard = LOCAL_IP_IFACE.get()?;
     let g = guard.lock().ok()?;
     g.clone().filter(|s| !s.is_empty())
+}
+
+/// 当前本机局域网 IP：Android 注入的 Wi-Fi 地址优先，否则枚举网卡；拿不到为空串。
+/// 供广播线程每轮重解析（Wi-Fi 重连/换网后地址会变化）。
+pub(crate) fn current_local_ip() -> String {
+    local_ip_override().or_else(local_ip).unwrap_or_default()
 }
 
 /// 探测本机非回环 IPv4：**枚举所有网卡接口**，挑出本机真实地址。
@@ -1251,23 +1396,39 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 
 
-static DISCOVERY_RUNNING: AtomicBool = AtomicBool::new(false);
+static DISCOVERY_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 
 
-/// 广播发现线程是否已在运行（供 /api/0/sync/status 查询）
+/// 发现线程是否已拉起（进程内只 spawn 一次，之后由 DISCOVERY_ACTIVE 控制实际收发）
+
+static DISCOVERY_THREADS_STARTED: AtomicBool = AtomicBool::new(false);
+
+
+
+/// 广播发现是否正在进行（供 /api/0/sync/status 查询）
 
 pub fn discovery_running() -> bool {
 
-    DISCOVERY_RUNNING.load(Ordering::SeqCst)
+    DISCOVERY_ACTIVE.load(Ordering::SeqCst)
 
 }
 
 
 
-fn set_discovery_running(v: bool) {
+/// 发现循环每轮检查的开关（discovery.rs 调用）：未开启时广播/监听空转
 
-    DISCOVERY_RUNNING.store(v, Ordering::SeqCst);
+pub(crate) fn discovery_active() -> bool {
+
+    DISCOVERY_ACTIVE.load(Ordering::SeqCst)
+
+}
+
+
+
+pub(crate) fn set_discovery_active(v: bool) {
+
+    DISCOVERY_ACTIVE.store(v, Ordering::SeqCst);
 
 }
 
@@ -1279,7 +1440,9 @@ fn set_discovery_running(v: bool) {
 
 pub fn reset_discovery_started_for_testing() {
 
-    set_discovery_running(false);
+    DISCOVERY_THREADS_STARTED.store(false, Ordering::SeqCst);
+
+    set_discovery_active(false);
 
 }
 

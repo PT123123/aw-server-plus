@@ -155,10 +155,37 @@ async fn config_save(state: &State<SharedManager>, cfg: Json<crate::models::Sync
             "[config] 同步设置已更新: enabled={}, discovery_method={}, listen_port={}, udp_port={}",
             cfg.enabled, cfg.discovery_method, cfg.listen_port, cfg.udp_port
         ));
-        // 若此刻开启了同步，立即启动广播发现与在线探测后台线程（无需重启服务）
-        m.spawn_discovery();
+        // 若此刻开启了同步，立即启动在线探测后台线程（无需重启服务）。
+        // 注意：不再自动启动发现广播——广播只由「进入局域网同步界面」驱动（discovery/start），
+        // 否则 Android 端 Wi-Fi 自动开启 enabled 时会在后台偷偷广播。
         m.spawn_probe();
         Ok(serde_json::to_value(m.get_config()).unwrap_or(serde_json::Value::Null))
+    })
+    .await
+}
+
+// ---- 发现广播开关（进入/离开「局域网同步」界面时由客户端调用） ----
+
+/// 进入界面：开始 UDP 广播宣告与监听处理（不进入界面绝不广播）
+#[post("/discovery/start")]
+async fn discovery_start(state: &State<SharedManager>) -> Res {
+    run(state, |m| {
+        m.start_discovery();
+        Ok(serde_json::json!({
+            "discovery_running": crate::manager::discovery_running()
+        }))
+    })
+    .await
+}
+
+/// 离开界面：停止广播与监听处理
+#[post("/discovery/stop")]
+async fn discovery_stop(state: &State<SharedManager>) -> Res {
+    run(state, |m| {
+        m.stop_discovery();
+        Ok(serde_json::json!({
+            "discovery_running": crate::manager::discovery_running()
+        }))
     })
     .await
 }
@@ -799,7 +826,8 @@ pub fn mount_rocket(rocket: Rocket<Build>, mgr: SharedManager) -> Rocket<Build> 
         .mount(
             "/api/0/sync",
             routes![
-                root, info, config, config_save, create_paircode, join,
+                root, info, config, config_save, discovery_start, discovery_stop,
+                create_paircode, join,
                 pair_initiate, pair_accept, pair_request, pair_confirm,
                 devices, add_device,
                 sync_now, device_delete, device_alias, devices_clear_all,

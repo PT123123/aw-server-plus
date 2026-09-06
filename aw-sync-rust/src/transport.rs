@@ -5,8 +5,11 @@
 use crate::models::{Device, SyncSnapshot};
 
 /// 构造一个带超时的 blocking HTTP 客户端（局域网内使用，短连接）。
+/// connect_timeout 必须显著小于总超时：对端不可达时（如设备离网）快速失败，
+/// 否则调用方（如自动同步）会持锁等满总超时，饿死其余接口。
 fn client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(2))
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| e.to_string())
@@ -94,6 +97,7 @@ pub fn push_snapshot(target: &crate::models::Device, snapshot: &SyncSnapshot) ->
     let url = format!("{}/push", target.endpoint());
     crate::dbglog::info(format!("[push] 开始推送到 {} ...", url));
     let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(2))
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| e.to_string())?;

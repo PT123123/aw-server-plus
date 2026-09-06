@@ -501,9 +501,12 @@ pub mod android {
             match aw_sync_rust::SyncManager::new(data_dir_sync.as_path(), sync_device_id) {
                 Ok(mgr) => {
                     if let Ok(g) = mgr.lock() {
-                        let _ = g.spawn_discovery();
                         let _ = g.spawn_d1_sync();
                     }
+                    // 局域网自动同步循环（enabled 由 Android 侧按 Wi-Fi 状态驱动）。
+                    // 注意：启动时不再自动拉起发现广播——广播只由「进入局域网同步界面」
+                    // 调 discovery/start 驱动，退出界面调 discovery/stop。
+                    let _ = aw_sync_rust::SyncManager::spawn_auto_sync(&mgr);
                     rocket = aw_sync_rust::endpoints::mount_rocket(rocket, mgr);
                     info!("[AW_SYNC] 局域网同步 + D1 云同步路由已挂载 (aw-sync-rust)");
                 }

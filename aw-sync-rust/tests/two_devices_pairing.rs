@@ -147,6 +147,7 @@ fn sync_log_direction_protocol_filtering_and_paging() {
         status: SyncStatus::Success,
         message: None,
         data_size: Some(128),
+        details: None,
     };
     db.add_log(&mk(SyncDirection::Out, SyncProtocol::Http, SyncEventType::Sync)).unwrap();
     db.add_log(&mk(SyncDirection::In, SyncProtocol::Http, SyncEventType::Sync)).unwrap();

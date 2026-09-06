@@ -207,6 +207,10 @@ pub struct SyncConfig {
     pub self_alias: String,
     /// 在线状态探测间隔（秒），用于已配对设备的心跳探测
     pub probe_interval: u16,
+    /// 局域网自动同步（拉取）间隔（秒），默认 10（狂暴档）。
+    /// 三档模式即该值的预设：狂暴 10 / 平和 300 / 静默 1800，手动改值即自定义。
+    #[serde(default = "default_sync_interval")]
+    pub sync_interval: u64,
 
     // ---- Cloudflare D1 云同步 ----
 
@@ -240,6 +244,7 @@ impl Default for SyncConfig {
             sync_todo: true,
             self_alias: String::new(),
             probe_interval: 10,
+            sync_interval: 10,
             d1_enabled: false,
             d1_account_id: String::new(),
             d1_database_id: String::new(),
@@ -247,6 +252,11 @@ impl Default for SyncConfig {
             d1_sync_interval: 300,
         }
     }
+}
+
+/// sync_interval 的 serde 默认值：老数据库没有该字段，默认 10 秒（狂暴档）。
+fn default_sync_interval() -> u64 {
+    10
 }
 
 /// d1_sync_interval 的 serde 默认值：老数据库的配置 JSON 没有该字段，默认 300 秒。

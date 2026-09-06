@@ -80,71 +80,90 @@ pub fn subnet_broadcast(local_ip: &str) -> Option<String> {
 }
 
 /// 在固定 UDP 端口周期广播本机信息。
-/// 阻塞线程运行，返回后调用方需 join（一般放入常驻线程）。
+/// 进程级开关 discovery_active() 由「进入/离开局域网同步界面」驱动：未开启时空转不发送。
+/// 每轮重新解析本机局域网 IP（Wi-Fi 重连/换网后自动切换新地址）；无有效 IP 时暂停宣告。
 pub fn broadcast_loop(info: SelfInfo, udp_port: u16, interval: Duration) {
-    let device = info.device;
-    // 强制从本机 Wi-Fi 网卡（device.ip）发包：把套接字绑定到该 IP，使广播报文从该网卡 egress、
-    // 源地址固定为本机真实 Wi-Fi 地址（避免走 VPN 默认路由）。绑定失败则回退 0.0.0.0（全部网卡）。
-    let bind_addr: SocketAddr = match format!("{}:0", device.ip).parse() {
-        Ok(a) => a,
-        Err(_) => "0.0.0.0:0".parse().unwrap(),
-    };
-    let socket = match UdpSocket::bind(bind_addr) {
-        Ok(s) => s,
-        Err(_) => match UdpSocket::bind("0.0.0.0:0".parse::<SocketAddr>().unwrap()) {
-            Ok(s2) => s2,
-            Err(e) => {
-                error!("[aw-sync][discovery] 无法绑定 UDP 广播套接字: {e}");
-                return;
-            }
-        },
-    };
-    let _ = socket.set_broadcast(true);
-    crate::dbglog::info(format!(
-        "[discovery] UDP 广播套接字绑定到 {}（本机地址 {}）",
-        bind_addr, device.ip
-    ));
-
-    // 未获取到真实局域网 IP 时不广播假地址：否则多台设备都会宣称同一个回环/空地址，
-    // 既互相无法区分，配对后又会错误地同步回本机。
-    if device.ip.is_empty() || device.ip == "127.0.0.1" || device.ip == "localhost" {
-        crate::dbglog::warn(format!(
-            "[discovery] 本机未获取到局域网 IP（当前 {}），暂停 UDP 广播宣告（请检查 Wi-Fi 连接）",
-            device.ip
-        ));
-        return;
-    }
-
-    // 广播目标：子网定向广播地址 + 端口
-    // 同时发送到 255.255.255.255（有限广播）作为后备，某些局域网环境下这种方式更可靠
-    let mut targets: Vec<SocketAddr> = Vec::new();
-    if let Some(subnet_bcast) = subnet_broadcast(&device.ip) {
-        if let Ok(a) = format!("{}:{udp_port}", subnet_bcast).parse() {
-            targets.push(a);
-        }
-    }
-    if let Ok(a) = format!("255.255.255.255:{udp_port}").parse() {
-        targets.push(a);
-    }
-    if targets.is_empty() {
-        return;
-    }
-
-    let payload = format!("{}\n{}", MAGIC, serde_json::to_string(&device).unwrap_or_default());
-    crate::dbglog::info(format!(
-        "[discovery] UDP 广播启动: 本机={}({}) {}:{} → 目标={} 端口 {}",
-        device.name, device.id, device.ip, device.port,
-        targets.iter().map(|t| t.ip().to_string()).collect::<Vec<_>>().join(", "),
-        udp_port
-    ));
-
+    let mut device = info.device;
     // 广播线程内独立的 sync.db 连接（把「发出广播宣告」写入同步报文信息）
     let out_db = SyncDb::open(Path::new(&info.data_dir)).ok();
+    let mut bound_ip = String::new();
+    let mut socket: Option<UdpSocket> = None;
 
     loop {
-        for tgt in &targets {
-            let _ = socket.send_to(payload.as_bytes(), *tgt);
+        // 未进入局域网同步界面：不广播
+        if !crate::manager::discovery_active() {
+            thread::sleep(Duration::from_millis(500));
+            continue;
         }
+
+        // 每轮重解析本机局域网 IP。未获取到真实局域网 IP 时不广播假地址：
+        // 否则多台设备都会宣称同一个回环/空地址，既互相无法区分，配对后又会错误地同步回本机。
+        let ip = crate::manager::current_local_ip();
+        if ip.is_empty() || ip == "127.0.0.1" || ip == "localhost" {
+            if !bound_ip.is_empty() {
+                crate::dbglog::warn(format!(
+                    "[discovery] 本机失去局域网 IP（原 {bound_ip}），暂停 UDP 广播宣告（请检查 Wi-Fi 连接）"
+                ));
+                bound_ip.clear();
+                socket = None;
+            }
+            thread::sleep(interval.max(Duration::from_secs(2)));
+            continue;
+        }
+
+        // IP 变化（首次或 Wi-Fi 重连）：重建套接字绑定到新地址，强制从该网卡发包
+        // （源地址固定为本机真实 Wi-Fi 地址，避免走 VPN 默认路由；绑定失败回退 0.0.0.0）。
+        if socket.is_none() || ip != bound_ip {
+            let bind_addr: SocketAddr = match format!("{}:0", ip).parse() {
+                Ok(a) => a,
+                Err(_) => "0.0.0.0:0".parse().unwrap(),
+            };
+            let s = match UdpSocket::bind(bind_addr) {
+                Ok(s) => s,
+                Err(_) => match UdpSocket::bind("0.0.0.0:0".parse::<SocketAddr>().unwrap()) {
+                    Ok(s2) => s2,
+                    Err(e) => {
+                        error!("[aw-sync][discovery] 无法绑定 UDP 广播套接字: {e}");
+                        thread::sleep(interval);
+                        continue;
+                    }
+                },
+            };
+            let _ = s.set_broadcast(true);
+            crate::dbglog::info(format!(
+                "[discovery] UDP 广播套接字绑定到 {}（本机地址 {ip}）",
+                bind_addr
+            ));
+            socket = Some(s);
+            bound_ip = ip.clone();
+            device.ip = ip.clone();
+        }
+        let sock = match &socket {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // 广播目标：子网定向广播地址 + 端口；同时发 255.255.255.255（有限广播）作为后备，
+        // 某些局域网环境下这种方式更可靠
+        let mut targets: Vec<SocketAddr> = Vec::new();
+        if let Some(subnet_bcast) = subnet_broadcast(&bound_ip) {
+            if let Ok(a) = format!("{}:{udp_port}", subnet_bcast).parse() {
+                targets.push(a);
+            }
+        }
+        if let Ok(a) = format!("255.255.255.255:{udp_port}").parse() {
+            targets.push(a);
+        }
+        if targets.is_empty() {
+            thread::sleep(interval);
+            continue;
+        }
+
+        let payload = format!("{}\n{}", MAGIC, serde_json::to_string(&device).unwrap_or_default());
+        for tgt in &targets {
+            let _ = sock.send_to(payload.as_bytes(), *tgt);
+        }
+        debug!("[aw-sync] 广播自我信息到 {}", targets[0]);
         // 出站广播报文：60 秒去抖，避免周期包刷屏
         if should_log(&format!("out-{}", device.id)) {
             crate::dbglog::info(format!(
@@ -170,8 +189,6 @@ pub fn broadcast_loop(info: SelfInfo, udp_port: u16, interval: Duration) {
             }
         }
         thread::sleep(interval);
-        // mDNS 预留：_aw-sync._tcp.local 注册/刷新
-        debug!("[aw-sync] 广播自我信息到 {}", targets[0]);
     }
 }
 
@@ -194,7 +211,14 @@ pub fn listener_loop(db: SharedDb, udp_port: u16, self_id: String) {
         }
     };
     let mut buf = [0u8; 4096];
+    // 读取超时：让循环能周期检查 discovery_active 开关
+    let _ = socket.set_read_timeout(Some(Duration::from_secs(2)));
     loop {
+        // 未进入局域网同步界面：不处理广播（内核接收缓冲满后自动丢弃新包）
+        if !crate::manager::discovery_active() {
+            thread::sleep(Duration::from_millis(500));
+            continue;
+        }
         match socket.recv_from(&mut buf) {
             Ok((n, src)) => {
                 let text = String::from_utf8_lossy(&buf[..n]).to_string();

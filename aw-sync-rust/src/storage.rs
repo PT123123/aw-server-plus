@@ -262,8 +262,9 @@ impl SyncDb {
     }
 
     pub fn get_logs(&self, f: &LogFilter) -> Result<Vec<SyncLogEntry>> {
+        // 注意：SELECT 列表顺序与下方 r.get(N) 索引一一对应，details 必须在第 10 列
         let mut sql =
-            String::from("SELECT id,timestamp,direction,protocol,peer_id,event_type,status,message,data_size FROM sync_log");
+            String::from("SELECT id,timestamp,direction,protocol,peer_id,event_type,status,message,data_size,details FROM sync_log");
         let mut conds: Vec<String> = Vec::new();
         if let Some(d) = &f.direction {
             conds.push(format!("direction='{}'", d.as_str()));
@@ -344,6 +345,9 @@ impl SyncDb {
             if let Some(v) = map.get("probe_interval") {
                 cfg.probe_interval = v.as_u64().unwrap_or(10) as u16;
             }
+            if let Some(v) = map.get("sync_interval") {
+                cfg.sync_interval = v.as_u64().unwrap_or(10).max(5);
+            }
             // Cloudflare D1 云同步
             if let Some(v) = map.get("d1_enabled") {
                 cfg.d1_enabled = v.as_bool().unwrap_or(false);
@@ -377,6 +381,9 @@ impl SyncDb {
                 "listen_port" | "udp_port" | "probe_interval" => {
                     map.insert(k, serde_json::json!(v.parse::<u16>().unwrap_or(0)));
                 }
+                "sync_interval" => {
+                    map.insert(k, serde_json::json!(v.parse::<u64>().unwrap_or(10)));
+                }
                 _ => {
                     map.insert(k, serde_json::json!(v));
                 }
@@ -396,6 +403,7 @@ impl SyncDb {
             ("sync_activity", cfg.sync_activity.to_string()),
             ("self_alias", cfg.self_alias.clone()),
             ("probe_interval", cfg.probe_interval.to_string()),
+            ("sync_interval", cfg.sync_interval.max(5).to_string()),
             // Cloudflare D1 云同步
             ("d1_enabled", cfg.d1_enabled.to_string()),
             ("d1_account_id", cfg.d1_account_id.clone()),
