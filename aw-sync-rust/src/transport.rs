@@ -10,7 +10,7 @@ use crate::models::{Device, SyncSnapshot};
 fn client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(2))
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| e.to_string())
 }
@@ -83,12 +83,20 @@ pub fn probe_online(target: &Device) -> Result<serde_json::Value, String> {
 
     let json: serde_json::Value = resp.json().map_err(|e| format!("解析探测响应失败: {e}"))?;
 
-    // 校验响应包含 self_device 字段（确认是 aw-sync 服务而非其他 HTTP 服务）
-    if json.get("self_device").is_none() {
-        return Err("探测响应缺少 self_device 字段，非 aw-sync 服务".to_string());
+    // 校验响应确为 aw-sync 服务：/info 返回裸 Device JSON（含 id 字段），
+    // 兼容 self_device 包装形式；二者皆无则判定为非 aw-sync 服务
+    if !valid_probe_response(&json) {
+        return Err("探测响应缺少 id 字段，非 aw-sync 服务".to_string());
     }
 
     Ok(json)
+}
+
+/// 校验 /info 响应是否来自 aw-sync 服务：
+/// 裸 Device JSON（含非空 "id"）或 { self_device: {...} } 包装形式均可。
+fn valid_probe_response(json: &serde_json::Value) -> bool {
+    json.get("id").map(|v| !v.is_null()).unwrap_or(false)
+        || json.get("self_device").map(|v| !v.is_null()).unwrap_or(false)
 }
 
 /// 把一个同步快照推送到对端（`POST http://<peer>:<port>/api/0/sync/push`）。
@@ -98,7 +106,7 @@ pub fn push_snapshot(target: &crate::models::Device, snapshot: &SyncSnapshot) ->
     crate::dbglog::info(format!("[push] 开始推送到 {} ...", url));
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(2))
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client
@@ -142,6 +150,21 @@ pub fn fetch_snapshot(target: &Device) -> Result<SyncSnapshot, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn probe_response_validation() {
+        // 裸 Device JSON（/info 实际返回格式）
+        assert!(super::valid_probe_response(
+            &serde_json::json!({"id": "abc", "name": "n", "ip": "1.2.3.4", "port": 56001})
+        ));
+        // 兼容 self_device 包装形式
+        assert!(super::valid_probe_response(
+            &serde_json::json!({"self_device": {"id": "abc"}})
+        ));
+        // 非 aw-sync 服务 / 空响应
+        assert!(!super::valid_probe_response(&serde_json::json!({"hello": "world"})));
+        assert!(!super::valid_probe_response(&serde_json::json!({})));
+    }
+
     #[test]
     fn endpoint_format() {
         let url = crate::models::Device {

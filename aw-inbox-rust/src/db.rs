@@ -132,6 +132,11 @@ pub fn migrate(conn: &DbConnection) -> Result<(), Error> {
             FOREIGN KEY (target_note_id) REFERENCES notes(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS sync_versions (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            global_version INTEGER NOT NULL DEFAULT 0
+        );
+
         "#,
     )?;
 
@@ -144,6 +149,11 @@ pub fn migrate(conn: &DbConnection) -> Result<(), Error> {
     // 为历史行补齐 uuid（P0 同步逻辑键；SQLite 对每行重新求值 randomblob）
     conn.execute(
         "UPDATE notes SET uuid = lower(hex(randomblob(16))) WHERE uuid IS NULL OR uuid = ''",
+        [],
+    )?;
+    // 版本计数种子行（b87fcd8 重构时误删了建表语句，老库缺表会导致笔记写入报 no such table → 400）
+    conn.execute(
+        "INSERT OR IGNORE INTO sync_versions (id, global_version) VALUES (1, 0)",
         [],
     )?;
 
@@ -202,6 +212,11 @@ pub fn migrate_todo(conn: &DbConnection) -> Result<(), Error> {
             deleted INTEGER NOT NULL DEFAULT 0,
             synced_at TEXT,
             uuid TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_versions (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            global_version INTEGER NOT NULL DEFAULT 0
         );
 
         "#,

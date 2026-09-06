@@ -502,6 +502,8 @@ pub mod android {
                 Ok(mgr) => {
                     if let Ok(g) = mgr.lock() {
                         let _ = g.spawn_d1_sync();
+                        // 在线探测循环（循环内按 enabled 门控；is_online 供自动同步过滤与前端展示）
+                        let _ = g.spawn_probe();
                     }
                     // 局域网自动同步循环（enabled 由 Android 侧按 Wi-Fi 状态驱动）。
                     // 注意：启动时不再自动拉起发现广播——广播只由「进入局域网同步界面」

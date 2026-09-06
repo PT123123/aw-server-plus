@@ -417,11 +417,23 @@ async fn devices(state: &State<SharedManager>) -> Res {
 
 #[post("/devices/<id>/sync")]
 async fn sync_now(state: &State<SharedManager>, id: String) -> Res {
-    run(state, move |m| {
-        let applied = m.sync_to(&id)?;
-        Ok(serde_json::json!({ "device_id": id, "applied": applied.applied, "result": applied }))
+    // 分阶段加锁版本：网络传输期间不持 manager 锁，同步页轮询不被大快照传输饿死
+    let mgr = state.inner().clone();
+    let dev_id = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::manager::SyncManager::sync_to_unlocked(&mgr, &dev_id, true)
     })
     .await
+    .map_err(|_| Status::InternalServerError)?;
+    match result {
+        Ok(applied) => Ok(Json(serde_json::json!({
+            "device_id": id, "applied": applied.applied, "result": applied
+        }))),
+        Err(e) => {
+            log::error!("[aw-sync] handler error: {e}");
+            Err(Status::InternalServerError)
+        }
+    }
 }
 
 #[delete("/devices/<id>")]

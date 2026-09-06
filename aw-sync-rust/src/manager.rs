@@ -330,73 +330,86 @@ impl SyncManager {
 
 
 
-    /// 立即向某设备推送一次同步。
+    /// 与某设备执行一次「拉-合-推」双向同步（分阶段加锁，不要求调用方持锁）。
+    /// ① 短锁取对端 → ② 网络拉快照（不持锁）→ ③ 短锁合并入本地（冲突自动仲裁、被覆盖方进回收站）
+    /// → ④ 短锁导出本地 → ⑤ 网络推送（不持锁）→ ⑥ 短锁登记与日志。
+    /// 网络传输期间不持有 manager 锁：大快照/慢链路传输不再饿死同步页等其余接口。
+    pub fn sync_to_unlocked(
+        mgr: &SharedManager,
+        peer_id: &str,
+        log_noop: bool,
+    ) -> Result<ApplyResult, String> {
+        let lock_err = || "同步管理器锁不可用".to_string();
 
-    /// 立即与某设备执行一次「拉-合-推」双向同步。
-    /// 1) 拉取对端快照 → 2) 本地合并（冲突自动仲裁、被覆盖方进回收站）→ 3) 导出本地推给对端。
-    pub fn sync_to(&self, peer_id: &str) -> Result<ApplyResult, String> {
-        self.sync_to_opts(peer_id, true)
-    }
+        // ① 取对端（短锁）
+        let peer = {
+            let g = mgr.lock().map_err(|_| lock_err())?;
+            g.get_device(peer_id)?.ok_or("未找到目标设备")?
+        };
 
-    /// 自动同步用的静默变体：无任何实际变更时不写成功日志，避免周期任务刷屏。
-    pub fn sync_to_quiet(&self, peer_id: &str) -> Result<ApplyResult, String> {
-        self.sync_to_opts(peer_id, false)
-    }
-
-    fn sync_to_opts(&self, peer_id: &str, log_noop: bool) -> Result<ApplyResult, String> {
-        let peer = self.get_device(peer_id)?.ok_or("未找到目标设备")?;
-
-        // 1) 拉取对端快照
+        // ② 拉取对端快照（不持锁）
         let remote = crate::transport::fetch_snapshot(&peer)?;
 
-        // 2) 合并进本地
-        let applied = self.apply_snapshot(&remote)?;
-
-        // 3) 导出本地（含新合并内容）推送给对端（对端侧合并为幂等，可安全重推）
-        let mut snap = SyncSnapshot {
-            source_device: Some(self.self_device_info()),
-            ..Default::default()
+        // ③ 合并进本地（短锁）
+        let (applied, self_id) = {
+            let g = mgr.lock().map_err(|_| lock_err())?;
+            let applied = g.apply_snapshot(&remote)?;
+            (applied, g.self_id.clone())
         };
-        self.export(&mut snap);
+
+        // ④ 导出本地（短锁，含新合并内容；对端侧合并为幂等，可安全重推）
+        let snap = {
+            let g = mgr.lock().map_err(|_| lock_err())?;
+            let mut snap = SyncSnapshot {
+                source_device: Some(g.self_device_info()),
+                ..Default::default()
+            };
+            g.export(&mut snap);
+            snap
+        };
+
+        // ⑤ 推送给对端（不持锁）
         let pushed = crate::transport::push_snapshot(&peer, &snap).unwrap_or(0);
 
-        self.db()
-            .mark_synced(&peer.id, Utc::now())
-            .map_err(|e| e.to_string())?;
-
+        // ⑥ 登记与日志（短锁）
         let size = snap
             .activity
             .as_ref()
             .map_or(0, |s| s.len() as u64)
             + snap.inbox.as_ref().map_or(0, |s| s.len() as u64)
             + snap.todo.as_ref().map_or(0, |s| s.len() as u64);
-
-        // 无实际变更且为周期自动同步时跳过成功日志（静默模式，避免刷爆同步报文）
-        let noop = applied.applied == 0 && pushed == 0 && applied.archived == 0;
-        if log_noop || !noop {
-            self.add_log(&SyncLogEntry {
-                id: None,
-                timestamp: Utc::now(),
-                direction: SyncDirection::Out,
-                protocol: SyncProtocol::Http,
-                peer_id: Some(peer.id.clone()),
-                event_type: SyncEventType::Sync,
-                status: SyncStatus::Success,
-                message: Some(format!(
-                    "本机({}) 与 {}({}) 双向同步完成: 拉取应用 {} 条(新增{} 更新{} 删除{})，推送 {} 条，归档 {} 条",
-                    self.self_id,
-                    peer.name,
-                    peer.id,
-                    applied.applied,
-                    applied.created,
-                    applied.updated,
-                    applied.deleted,
-                    pushed,
-                    applied.archived
-                )),
-                data_size: Some(size),
-                details: if applied.records.is_empty() { None } else { Some(applied.records.clone()) },
-            })?;
+        {
+            let g = mgr.lock().map_err(|_| lock_err())?;
+            g.db()
+                .mark_synced(&peer.id, Utc::now())
+                .map_err(|e| e.to_string())?;
+            // 无实际变更且为周期自动同步时跳过成功日志（静默模式，避免刷爆同步报文）
+            let noop = applied.applied == 0 && pushed == 0 && applied.archived == 0;
+            if log_noop || !noop {
+                g.add_log(&SyncLogEntry {
+                    id: None,
+                    timestamp: Utc::now(),
+                    direction: SyncDirection::Out,
+                    protocol: SyncProtocol::Http,
+                    peer_id: Some(peer.id.clone()),
+                    event_type: SyncEventType::Sync,
+                    status: SyncStatus::Success,
+                    message: Some(format!(
+                        "本机({}) 与 {}({}) 双向同步完成: 拉取应用 {} 条(新增{} 更新{} 删除{})，推送 {} 条，归档 {} 条",
+                        self_id,
+                        peer.name,
+                        peer.id,
+                        applied.applied,
+                        applied.created,
+                        applied.updated,
+                        applied.deleted,
+                        pushed,
+                        applied.archived
+                    )),
+                    data_size: Some(size),
+                    details: if applied.records.is_empty() { None } else { Some(applied.records.clone()) },
+                })?;
+            }
         }
 
         Ok(applied)
@@ -717,21 +730,12 @@ impl SyncManager {
                                     ));
                                     continue;
                                 }
-                                // try_lock：前台请求正持锁时本轮跳过，后台同步不与 UI 抢锁
-                                match mgr.try_lock() {
-                                    Ok(g) => {
-                                        if let Err(e) = g.sync_to_quiet(&d.id) {
-                                            crate::dbglog::warn(format!(
-                                                "[auto] 与设备 {}({}) 自动同步失败: {e}",
-                                                d.name, d.id
-                                            ));
-                                        }
-                                    }
-                                    Err(_) => {
-                                        crate::dbglog::info(
-                                            "[auto] 同步锁被占用（前台请求优先），本轮跳过".to_string(),
-                                        );
-                                    }
+                                // 分阶段加锁同步：网络传输不持锁，UI 请求只与短小的本地阶段竞争
+                                if let Err(e) = SyncManager::sync_to_unlocked(&mgr, &d.id, false) {
+                                    crate::dbglog::warn(format!(
+                                        "[auto] 与设备 {}({}) 自动同步失败: {e}",
+                                        d.name, d.id
+                                    ));
                                 }
                             }
                         }
