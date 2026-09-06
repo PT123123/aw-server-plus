@@ -57,6 +57,7 @@ pub enum SyncProtocol {
     Http,
     UdpBroadcast,
     Mdns,
+    D1,
 }
 
 impl SyncProtocol {
@@ -65,6 +66,7 @@ impl SyncProtocol {
             SyncProtocol::Http => "http",
             SyncProtocol::UdpBroadcast => "udp_broadcast",
             SyncProtocol::Mdns => "mdns",
+            SyncProtocol::D1 => "d1",
         }
     }
 }

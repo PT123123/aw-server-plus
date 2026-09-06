@@ -1063,6 +1063,28 @@ pub fn d1_sync_now_full(
     Ok(result)
 }
 
+/// 清除 D1 上的本机 checkpoint（前端「重置同步」按钮入口）。
+pub fn d1_clear_checkpoint(
+    account_id: &str,
+    database_id: &str,
+    api_token: &str,
+    device_id: &str,
+) -> Result<(), String> {
+    let client = D1Client::new(
+        account_id.to_string(),
+        database_id.to_string(),
+        api_token.to_string(),
+        device_id.to_string(),
+    )?;
+    let sql = format!(
+        "DELETE FROM sync_state WHERE device_id = '{}'",
+        escape_sql(device_id)
+    );
+    client.execute(&sql)?;
+    info!("[d1] checkpoint 已清除: device_id={device_id}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

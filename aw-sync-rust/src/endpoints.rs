@@ -52,6 +52,31 @@ async fn d1_full_sync(state: &State<SharedManager>) -> Res {
     .await
 }
 
+#[post("/d1/reset")]
+async fn d1_reset(state: &State<SharedManager>) -> Res {
+    run(state, |m| {
+        m.d1_clear_checkpoint()?;
+        Ok(serde_json::json!({ "ok": true }))
+    })
+    .await
+}
+
+/// D1 同步历史日志：过滤 protocol=d1 的 sync_log 条目。
+#[get("/d1/logs?<query..>")]
+async fn d1_logs(query: LogQuery, state: &State<SharedManager>) -> Res {
+    run(state, move |m| {
+        let filter = LogFilter {
+            direction: None,
+            protocol: Some(SyncProtocol::D1),
+            event_type: None,
+            limit: query.limit.unwrap_or(20).max(1).min(100) as u64,
+            offset: query.offset.unwrap_or(0) as u64,
+        };
+        let list = m.list_logs(&filter).map_err(|e| e.to_string())?;
+        Ok(serde_json::to_value(list).unwrap_or(serde_json::Value::Null))
+    }).await
+}
+
 type Res = Result<Json<serde_json::Value>, Status>;
 
 /// 在阻塞线程中执行同步管理器操作，统一返回 Json<Value>。
@@ -502,6 +527,7 @@ async fn logs(state: &State<SharedManager>, query: LogQuery) -> Res {
             protocol: empty_as_none(query.protocol).as_deref().map(|s| match s {
                 "udp_broadcast" => SyncProtocol::UdpBroadcast,
                 "mdns" => SyncProtocol::Mdns,
+                "d1" => SyncProtocol::D1,
                 _ => SyncProtocol::Http,
             }),
             event_type: empty_as_none(query.event_type).as_deref().map(|s| match s {
@@ -780,7 +806,7 @@ pub fn mount_rocket(rocket: Rocket<Build>, mgr: SharedManager) -> Rocket<Build> 
                 device_stats, device_conflicts,
                 logs, log_clear, push, apply, snapshot, debug_log, status,
                 trash_list, trash_restore, trash_delete, trash_clear_all,
-                d1_test, d1_status, d1_sync_now, d1_full_sync
+                d1_test, d1_status, d1_sync_now, d1_full_sync, d1_reset, d1_logs
             ],
         )
 }

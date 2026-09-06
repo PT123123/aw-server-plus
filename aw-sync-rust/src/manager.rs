@@ -605,6 +605,27 @@ impl SyncManager {
                                     result.conflicts,
                                     result.errors.len()
                                 ));
+                                // 写入 sync_log
+                                if let Ok(db) = SyncDb::open(&data_dir) {
+                                    let log_entry = SyncLogEntry {
+                                        id: None,
+                                        timestamp: Utc::now(),
+                                        direction: SyncDirection::Out,
+                                        protocol: SyncProtocol::D1,
+                                        peer_id: None,
+                                        event_type: SyncEventType::Sync,
+                                        status: if result.ok { SyncStatus::Success } else { SyncStatus::Failed },
+                                        message: Some(format!(
+                                            "推送 {} 笔记 / {} TODO · 拉取 {} 笔记 / {} TODO · 冲突 {}",
+                                            result.pushed_notes, result.pushed_todos,
+                                            result.pulled_notes, result.pulled_todos,
+                                            result.conflicts
+                                        )),
+                                        data_size: None,
+                                        details: None,
+                                    };
+                                    let _ = db.add_log(&log_entry);
+                                }
                                 if result.ok {
                                     let now = Utc::now().to_rfc3339();
                                     if let Ok(db) = SyncDb::open(&data_dir) {
@@ -865,10 +886,33 @@ impl SyncManager {
         Ok(crate::d1_sync::d1_status(&cfg, last_sync))
     }
 
-    /// 触发一次 D1 双向同步。成功后更新 d1_last_sync 时间戳。
+    /// 触发一次 D1 双向同步。成功后更新 d1_last_sync 时间戳并写入 sync_log。
     pub fn d1_sync_now(&self) -> Result<crate::d1_sync::D1SyncResult, String> {
         let cfg = self.get_config();
         let result = crate::d1_sync::d1_sync_now(&self.data_dir, &self.self_id, &cfg)?;
+
+        // 写入 sync_log，供同步详情展示
+        let log_entry = SyncLogEntry {
+            id: None,
+            timestamp: Utc::now(),
+            direction: SyncDirection::Out,
+            protocol: SyncProtocol::D1,
+            peer_id: None,
+            event_type: SyncEventType::Sync,
+            status: if result.ok { SyncStatus::Success } else { SyncStatus::Failed },
+            message: Some(format!(
+                "推送 {} 笔记 / {} TODO · 拉取 {} 笔记 / {} TODO · 冲突 {}",
+                result.pushed_notes, result.pushed_todos,
+                result.pulled_notes, result.pulled_todos,
+                result.conflicts
+            )),
+            data_size: None,
+            details: None,
+        };
+        if let Err(e) = self.add_log(&log_entry) {
+            crate::dbglog::warn(format!("[d1] 写入 sync_log 失败: {e}"));
+        }
+
         if result.ok {
             let now = Utc::now().to_rfc3339();
             if let Err(e) = self.db().set_d1_last_sync(&now) {
@@ -882,6 +926,30 @@ impl SyncManager {
     pub fn d1_full_sync(&self) -> Result<crate::d1_sync::D1SyncResult, String> {
         let cfg = self.get_config();
         let result = crate::d1_sync::d1_sync_now_full(&self.data_dir, &self.self_id, &cfg)?;
+
+        // 写入 sync_log
+        let log_entry = SyncLogEntry {
+            id: None,
+            timestamp: Utc::now(),
+            direction: SyncDirection::Out,
+            protocol: SyncProtocol::D1,
+            peer_id: None,
+            event_type: SyncEventType::Sync,
+            status: if result.ok { SyncStatus::Success } else { SyncStatus::Failed },
+            message: Some(format!(
+                "[全量] 推送 {} 笔记 / {} TODO · 拉取 {} 笔记 / {} TODO · 冲突 {}",
+                result.pushed_notes, result.pushed_todos,
+                result.pulled_notes, result.pulled_todos,
+                result.conflicts
+            )),
+            data_size: None,
+            details: None,
+        };
+        if let Err(e) = self.add_log(&log_entry) {
+            crate::dbglog::warn(format!("[d1] 写入 sync_log 失败: {e}"));
+        }
+
+
         if result.ok {
             let now = Utc::now().to_rfc3339();
             if let Err(e) = self.db().set_d1_last_sync(&now) {
@@ -889,6 +957,17 @@ impl SyncManager {
             }
         }
         Ok(result)
+    }
+
+    /// 清除 D1 上的本机 checkpoint（重置同步状态）。
+    pub fn d1_clear_checkpoint(&self) -> Result<(), String> {
+        let cfg = self.get_config();
+        crate::d1_sync::d1_clear_checkpoint(
+            &cfg.d1_account_id,
+            &cfg.d1_database_id,
+            &cfg.d1_api_token,
+            &self.self_id,
+        )
     }
 
     /// 本机 Device（用于展示与广播）。
