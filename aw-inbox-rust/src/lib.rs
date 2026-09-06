@@ -24,12 +24,12 @@ impl<'r> FromRequest<'r> for DeviceIdGuard {
 }
 
 pub mod db;
-mod models;
+pub mod models;
 // Ensure models.rs has correct Note/NoteResponse definitions (tags: Vec<String>)
 use crate::models::{
     CreateCommentPayload, CreateNotePayload, CreateNoteRelationPayload, CreateTodoPayload,
-    DetailedTag, Note, NoteHistoryResponse, NoteRelation, NoteResponse, Todo, TodoResponse,
-    UpdateNotePayload, UpdateTodoPayload, note_history_to_response,
+    DetailedTag, Note, NoteHistoryResponse, NoteRelation, NoteResponse, TagTreeResponse, Todo,
+    TodoResponse, UpdateNotePayload, UpdateTodoPayload, note_history_to_response,
 };
 
 // --- Use correct DbConnection type ---
@@ -100,6 +100,21 @@ async fn get_tags(db_state: &State<SharedDb>) -> Result<Json<Vec<String>>, Statu
     .await
     .map_err(handle_spawn_error)? // Single '?'
     .map(Json)
+}
+
+// 层级标签树：tag 按 `/` 分段（如 项目/工作），count 含子孙前缀匹配计数
+#[get("/tags/tree")]
+async fn get_tag_tree(db_state: &State<SharedDb>) -> Result<Json<TagTreeResponse>, Status> {
+    let db_arc = db_state.inner().clone();
+
+    let tags = task::spawn_blocking(move || {
+        let conn = db_arc.lock().map_err(|_| Status::InternalServerError)?;
+        db::get_tag_tree_db(&conn).map_err(handle_db_error)
+    })
+    .await
+    .map_err(handle_spawn_error)??;
+
+    Ok(Json(TagTreeResponse { tags }))
 }
 
 // 获取笔记的评论
@@ -229,6 +244,7 @@ pub fn mount_rocket(rocket: Rocket<Build>, db: SharedDb, todo_db: SharedTodoDb) 
     info!("  - PUT    /inbox/notes/<id>/restore");
     info!("  - GET    /inbox/tags");
     info!("  - GET    /inbox/tags/detailed");
+    info!("  - GET    /inbox/tags/tree");
     info!("  - GET    /inbox/notes/<note_id>/comments");
     info!("  - POST   /inbox/notes/<note_id>/comments (format=json)");
     info!("  - POST   /inbox/notes/<source_id>/relations/<target_id> (format=json)");
@@ -254,6 +270,7 @@ pub fn mount_rocket(rocket: Rocket<Build>, db: SharedDb, todo_db: SharedTodoDb) 
             restore_note,
             get_tags,
             get_detailed_tags,
+            get_tag_tree,
             // 评论和关系相关路由
             get_comments,
             add_comment,

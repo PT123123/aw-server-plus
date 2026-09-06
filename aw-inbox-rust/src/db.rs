@@ -1,7 +1,8 @@
 // src/db.rs
 use crate::models::{
     CreateCommentPayload, CreateNotePayload, CreateNoteRelationPayload, CreateTodoPayload,
-    DetailedTag, Note, NoteRelation, NoteRelationType, Todo, UpdateNotePayload, UpdateTodoPayload,
+    DetailedTag, Note, NoteRelation, NoteRelationType, TagNode, Todo, UpdateNotePayload,
+    UpdateTodoPayload,
 }; // Updated imports
 use chrono::{DateTime, Utc};
 use log::{info, warn};
@@ -355,8 +356,16 @@ pub fn get_notes_db(
     let mut params_vec: Vec<Box<dyn ToSql>> = Vec::new();
 
     if let Some(t) = tag {
-        query_str.push_str(" AND tags LIKE ?");
-        params_vec.push(Box::new(format!("%\"{}\"%", t)));
+        // 层级 tag 前缀匹配（段边界）：`项目` 命中 tag `项目` 及 `项目/...` 全部子孙，
+        // 但不命中 `项目2`。tags 列存 JSON 数组文本（元素形如 "tag"），
+        // 故匹配 `"t"`（整元素）或 `"t/`（元素前缀）。LIKE 通配符需转义。
+        let escaped = t
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        query_str.push_str(" AND (tags LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')");
+        params_vec.push(Box::new(format!("%\"{}\"%", escaped)));
+        params_vec.push(Box::new(format!("%\"{}/%", escaped)));
     }
     if let Some(after) = created_after {
         query_str.push_str(" AND created_at >= ?");
@@ -599,6 +608,94 @@ pub fn get_detailed_tags_db(conn: &DbConnection) -> Result<Vec<DetailedTag>, Err
         result.push(tag_result?);
     }
     Ok(result)
+}
+
+/// 层级标签树：tag 字符串按 `/` 分段构成路径树（如 `项目/工作`）。
+/// count 为前缀匹配计数（本路径 + 全部子孙的笔记数），与 GET /inbox/notes?tag= 的语义一致。
+/// 只统计未删除笔记；空段（`a//b`、首尾 `/`）被跳过。
+pub fn get_tag_tree_db(conn: &DbConnection) -> Result<Vec<TagNode>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT tags FROM notes WHERE deleted = 0 AND json_valid(tags) AND json_type(tags) = 'array'",
+    )?;
+    let rows: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // 精确 tag → 笔记数（同一笔记内的重复 tag 只计一次）
+    let mut exact: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for tags_json in rows {
+        if let Ok(tags) = serde_json::from_str::<Vec<String>>(&tags_json) {
+            let mut seen = std::collections::HashSet::new();
+            for tag in tags {
+                let tag = tag.trim().to_string();
+                if tag.is_empty() || !seen.insert(tag.clone()) {
+                    continue;
+                }
+                *exact.entry(tag).or_insert(0) += 1;
+            }
+        } else {
+            warn!("警告：无法从数据库解析标签 JSON：{}", tags_json);
+        }
+    }
+
+    // 逐 tag 沿路径累加前缀计数，并记录父子关系
+    let mut incl: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut children_map: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new(); // 父路径 → 子路径（仅直接子级）
+    for (tag, count) in &exact {
+        let mut path = String::new();
+        for seg in tag.split('/') {
+            let seg = seg.trim();
+            if seg.is_empty() {
+                continue;
+            }
+            let parent = if path.is_empty() { None } else { Some(path.clone()) };
+            if path.is_empty() {
+                path.push_str(seg);
+            } else {
+                path.push('/');
+                path.push_str(seg);
+            }
+            *incl.entry(path.clone()).or_insert(0) += count;
+            if let Some(p) = parent {
+                let entry = children_map.entry(p).or_default();
+                if !entry.contains(&path) {
+                    entry.push(path.clone());
+                }
+            }
+        }
+    }
+
+    // 递归构建树，子节点按路径排序保证输出稳定
+    fn build(path: String, incl: &std::collections::HashMap<String, i64>, children_map: &std::collections::HashMap<String, Vec<String>>) -> TagNode {
+        let children = children_map
+            .get(&path)
+            .map(|childs| {
+                let mut sorted = childs.clone();
+                sorted.sort();
+                sorted
+                    .into_iter()
+                    .map(|c| build(c, incl, children_map))
+                    .collect()
+            })
+            .unwrap_or_default();
+        TagNode {
+            count: incl.get(&path).copied().unwrap_or(0),
+            path,
+            children,
+        }
+    }
+
+    // 根节点 = 无 `/` 的前缀路径。注意不能只看被精确打过的 tag：
+    // `项目` 可能只是 `项目/工作` 的中间节点，没人直接打 `项目`，但它必须在树里（chips 要能逐级下钻）。
+    let mut roots: Vec<String> = incl
+        .keys()
+        .filter(|t| !t.contains('/'))
+        .cloned()
+        .collect();
+    roots.sort();
+    Ok(roots.into_iter().map(|r| build(r, &incl, &children_map)).collect())
 }
 
 // --- 笔记关系操作 ---

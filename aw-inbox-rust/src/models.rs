@@ -68,6 +68,22 @@ pub struct DetailedTag {
     pub last_modified: Option<DateTime<Utc>>, // <<< Changed from Option<String>
 }
 
+// 层级标签树节点（GET /inbox/tags/tree）。
+// 层级只是 tag 字符串里 `/` 分段的约定，存储仍是单个 text tag；
+// count 为「前缀匹配计数」：含本路径自身及其全部子孙的笔记数。
+#[derive(Serialize, Debug, Clone)]
+pub struct TagNode {
+    pub path: String,
+    pub count: i64,
+    pub children: Vec<TagNode>,
+}
+
+// GET /inbox/tags/tree 的响应包装
+#[derive(Serialize, Debug)]
+pub struct TagTreeResponse {
+    pub tags: Vec<TagNode>,
+}
+
 // 笔记关系类型枚举
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum NoteRelationType {
