@@ -878,6 +878,19 @@ impl SyncManager {
         Ok(result)
     }
 
+    /// 触发一次强制全量 D1 同步（清空 checkpoint 后全量拉取）。
+    pub fn d1_full_sync(&self) -> Result<crate::d1_sync::D1SyncResult, String> {
+        let cfg = self.get_config();
+        let result = crate::d1_sync::d1_sync_now_full(&self.data_dir, &self.self_id, &cfg)?;
+        if result.ok {
+            let now = Utc::now().to_rfc3339();
+            if let Err(e) = self.db().set_d1_last_sync(&now) {
+                crate::dbglog::warn(format!("[d1] 更新 d1_last_sync 失败: {e}"));
+            }
+        }
+        Ok(result)
+    }
+
     /// 本机 Device（用于展示与广播）。
 
     pub fn self_device_info(&self) -> Device {

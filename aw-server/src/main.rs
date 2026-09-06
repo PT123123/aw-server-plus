@@ -137,6 +137,13 @@ async fn main() -> Result<(), rocket::Error> {
     };
     info!("Using DB at path {:?}", db_path);
 
+    // 同步子系统（LAN 快照 + D1 云同步）的内容目录：与 UI 实际使用的内容库同目录，
+    // 即 --dbpath 的父目录；未指定 --dbpath 时回退 ActivityWatch 默认数据目录。
+    let sync_content_dir = std::path::Path::new(&db_path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .or_else(|| dirs::get_data_dir().ok());
+
     // Only use legacy import if opts.dbpath is not set
     let legacy_import = !opts.no_legacy_import && opts.dbpath.is_none();
     if opts.dbpath.is_some() {
@@ -201,7 +208,20 @@ async fn main() -> Result<(), rocket::Error> {
     let mut rocket = rocket;
 
     // ===== 挂载局域网同步 (aw-sync-rust) =====
-    if let Ok(data_dir_sync) = dirs::get_data_dir() {
+    if let Some(data_dir_sync) = sync_content_dir {
+        // 一次性迁移：旧默认目录中的 sync.db（D1 配置 + LAN 配对记录）搬到内容目录
+        let sync_db = data_dir_sync.join("sync.db");
+        if !sync_db.exists() {
+            if let Ok(legacy_dir) = dirs::get_data_dir() {
+                let legacy_sync_db = legacy_dir.join("sync.db");
+                if legacy_sync_db.exists() {
+                    match std::fs::copy(&legacy_sync_db, &sync_db) {
+                        Ok(_) => info!("已迁移 sync.db 到内容数据目录: {:?}", sync_db),
+                        Err(e) => info!("sync.db 迁移失败(以空配置继续启动): {e}"),
+                    }
+                }
+            }
+        }
         match aw_sync_rust::SyncManager::new(data_dir_sync.as_path(), sync_device_id) {
             Ok(mgr) => {
                 if let Ok(g) = mgr.lock() {

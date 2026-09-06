@@ -9,8 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::manager::{SharedManager, SyncManager};
 use crate::models::{
-    Device, SyncConfig, SyncDirection, SyncEventType, SyncLogEntry, SyncProtocol, SyncSnapshot,
-    SyncStatus,
+    Device, SyncDirection, SyncEventType, SyncLogEntry, SyncProtocol, SyncSnapshot, SyncStatus,
 };
 use crate::storage::LogFilter;
 use chrono::Utc;
@@ -39,6 +38,15 @@ async fn d1_status(state: &State<SharedManager>) -> Res {
 async fn d1_sync_now(state: &State<SharedManager>) -> Res {
     run(state, |m| {
         let result = m.d1_sync_now()?;
+        Ok(serde_json::to_value(result).unwrap_or(serde_json::Value::Null))
+    })
+    .await
+}
+
+#[post("/d1/full_sync")]
+async fn d1_full_sync(state: &State<SharedManager>) -> Res {
+    run(state, |m| {
+        let result = m.d1_full_sync()?;
         Ok(serde_json::to_value(result).unwrap_or(serde_json::Value::Null))
     })
     .await
@@ -772,7 +780,7 @@ pub fn mount_rocket(rocket: Rocket<Build>, mgr: SharedManager) -> Rocket<Build> 
                 device_stats, device_conflicts,
                 logs, log_clear, push, apply, snapshot, debug_log, status,
                 trash_list, trash_restore, trash_delete, trash_clear_all,
-                d1_test, d1_status, d1_sync_now
+                d1_test, d1_status, d1_sync_now, d1_full_sync
             ],
         )
 }

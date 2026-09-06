@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use log::info;
 use reqwest::blocking::Client;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -162,24 +163,42 @@ pub struct D1Response {
     pub errors: Vec<D1Error>,
 }
 
-/// D1 API 原始查询响应（/raw 端点）
+/// D1 API 原始查询响应（/raw 端点）。
+/// 实际信封：{"result":[{ "results": {"columns":[..],"rows":[[..]]}, "meta":{..}, "success":true }], "success":true}
+/// —— result 是按语句的数组，顶层没有 results 字段。
 #[derive(Debug, Deserialize)]
 pub struct D1RawResponse {
     pub success: bool,
+    #[serde(default)]
+    pub result: Vec<D1RawStatement>,
+    #[serde(default)]
+    pub errors: Vec<D1Error>,
+}
+
+/// /raw 中单条语句的结果
+#[derive(Debug, Default, Deserialize)]
+pub struct D1RawStatement {
     #[serde(default)]
     pub results: D1RawResults,
     #[serde(default)]
     pub meta: Option<D1Meta>,
     #[serde(default)]
-    pub errors: Vec<D1Error>,
+    pub success: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct D1RawResults {
     #[serde(default)]
     pub columns: Vec<String>,
     #[serde(default)]
     pub rows: Vec<Vec<Value>>,
+}
+
+impl D1RawResponse {
+    /// 取第一条语句的结果集（本模块所有调用均为单语句查询）
+    pub fn first_results(&self) -> Option<&D1RawResults> {
+        self.result.first().map(|s| &s.results)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -435,18 +454,64 @@ impl D1Client {
                 deleted INTEGER NOT NULL DEFAULT 0,
                 synced_at TEXT
             )"#,
-            r#"CREATE TABLE IF NOT EXISTS sync_state (
-                device_id TEXT PRIMARY KEY,
-                last_sync_at TEXT NOT NULL,
-                device_name TEXT
-            )"#,
             r#"CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at)"#,
             r#"CREATE INDEX IF NOT EXISTS idx_todos_updated ON todos(updated_at)"#,
         ];
         for sql in statements {
             self.query(sql)?;
         }
+        // sync_state: 迁移到新结构 (device_id, table_name) 复合 PK
+        self.migrate_sync_state()?;
         info!("✅ D1 数据库表结构初始化完成");
+        Ok(())
+    }
+
+    /// 迁移 sync_state 表到 (device_id, table_name) 复合 PK 结构。
+    /// 旧表每个设备一行，新表每个设备×每个表一行，实现 per-table 独立同步。
+    fn migrate_sync_state(&self) -> Result<(), String> {
+        // 检测新结构是否已存在：尝试查询 table_name 列
+        if self.raw("SELECT table_name FROM sync_state LIMIT 1").is_ok() {
+            return Ok(()); // 已是新结构
+        }
+
+        // 尝试读取旧表数据（如果存在旧结构）
+        let old_data = self.raw("SELECT device_id, last_sync_at, device_name FROM sync_state LIMIT 1")
+            .ok()
+            .and_then(|r| r.first_results().map(|rs| rs.rows.clone()));
+
+        // 删除旧表（如果存在），创建新结构
+        self.query("DROP TABLE IF EXISTS sync_state")?;
+        self.query(r#"CREATE TABLE sync_state (
+            device_id TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            last_sync_at TEXT NOT NULL,
+            device_name TEXT,
+            PRIMARY KEY (device_id, table_name)
+        )"#)?;
+
+        // 恢复旧数据为 notes + todos 两行
+        if let Some(rows) = old_data {
+            for row in &rows {
+                let device_id = row.get(0).and_then(|v| v.as_str()).unwrap_or("");
+                let last_sync = row.get(1).and_then(|v| v.as_str()).unwrap_or("");
+                let device_name = row.get(2).and_then(|v| v.as_str()).unwrap_or("");
+                if device_id.is_empty() { continue; }
+                self.query(&format!(
+                    "INSERT INTO sync_state (device_id, table_name, last_sync_at, device_name) \
+                     VALUES ('{}', 'notes', '{}', '{}')",
+                    escape_sql(device_id), escape_sql(last_sync), escape_sql(device_name)
+                ))?;
+                self.query(&format!(
+                    "INSERT INTO sync_state (device_id, table_name, last_sync_at, device_name) \
+                     VALUES ('{}', 'todos', '{}', '{}')",
+                    escape_sql(device_id), escape_sql(last_sync), escape_sql(device_name)
+                ))?;
+            }
+            info!("✅ sync_state 表结构迁移完成：{} 个设备", rows.len());
+        } else {
+            info!("✅ sync_state 新表创建完成（无旧数据）");
+        }
+
         Ok(())
     }
 
@@ -556,7 +621,7 @@ impl D1Client {
 
         let resp = self.raw(&sql)?;
         let mut notes = Vec::new();
-        for row in &resp.results.rows {
+        for row in resp.first_results().map(|r| r.rows.as_slice()).unwrap_or(&[]) {
             notes.push(NoteRow {
                 id: 0,
                 uuid: row.get(0).and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -578,7 +643,7 @@ impl D1Client {
         };
         let rel_resp = self.raw(&rel_sql)?;
         let mut relations = Vec::new();
-        for row in &rel_resp.results.rows {
+        for row in rel_resp.first_results().map(|r| r.rows.as_slice()).unwrap_or(&[]) {
             relations.push(RelationRow {
                 id: 0,
                 source_note_id: row.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
@@ -608,7 +673,7 @@ impl D1Client {
 
         let resp = self.raw(&sql)?;
         let mut todos = Vec::new();
-        for row in &resp.results.rows {
+        for row in resp.first_results().map(|r| r.rows.as_slice()).unwrap_or(&[]) {
             todos.push(TodoRow {
                 id: 0,
                 uuid: row.get(0).and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -638,14 +703,15 @@ impl D1Client {
         Ok(outcome)
     }
 
-    /// 更新本机同步状态到 D1
-    pub fn update_sync_state(&self) -> Result<(), String> {
+    /// 更新本机指定表的同步状态到 D1
+    pub fn update_sync_state(&self, table_name: &str) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
         let sql = format!(
-            "INSERT INTO sync_state (device_id,last_sync_at,device_name) \
-             VALUES ('{}','{}','{}') \
-             ON CONFLICT(device_id) DO UPDATE SET last_sync_at=excluded.last_sync_at, device_name=excluded.device_name",
+            "INSERT INTO sync_state (device_id,table_name,last_sync_at,device_name) \
+             VALUES ('{}','{}','{}','{}') \
+             ON CONFLICT(device_id,table_name) DO UPDATE SET last_sync_at=excluded.last_sync_at",
             escape_sql(&self.device_id),
+            escape_sql(table_name),
             escape_sql(&now),
             escape_sql(&self.device_id)
         );
@@ -653,14 +719,15 @@ impl D1Client {
         Ok(())
     }
 
-    /// 获取本机上次同步时间
-    pub fn get_last_sync(&self) -> Result<Option<String>, String> {
+    /// 获取本机指定表的上次同步时间
+    pub fn get_last_sync(&self, table_name: &str) -> Result<Option<String>, String> {
         let sql = format!(
-            "SELECT last_sync_at FROM sync_state WHERE device_id = '{}'",
-            escape_sql(&self.device_id)
+            "SELECT last_sync_at FROM sync_state WHERE device_id = '{}' AND table_name = '{}'",
+            escape_sql(&self.device_id),
+            escape_sql(table_name)
         );
         let resp = self.raw(&sql)?;
-        if let Some(row) = resp.results.rows.first() {
+        if let Some(row) = resp.first_results().and_then(|r| r.rows.first()) {
             Ok(row.get(0).and_then(|v| v.as_str()).map(|s| s.to_string()))
         } else {
             Ok(None)
@@ -673,7 +740,107 @@ fn escape_sql(s: &str) -> String {
     s.replace('\'', "''")
 }
 
+/// 检查本地 inbox 数据库是否为空（无笔记记录）
+fn is_inbox_empty(db_path: &Path) -> bool {
+    if !db_path.exists() {
+        return true;
+    }
+    if let Ok(conn) = Connection::open(db_path) {
+        if let Ok(count) = conn.query_row("SELECT COUNT(*) FROM notes", [], |r| r.get::<_, i64>(0)) {
+            return count == 0;
+        }
+    }
+    true
+}
+
+/// 检查本地 todo 数据库是否为空
+fn is_todo_empty(db_path: &Path) -> bool {
+    if !db_path.exists() {
+        return true;
+    }
+    if let Ok(conn) = Connection::open(db_path) {
+        if let Ok(count) = conn.query_row("SELECT COUNT(*) FROM todos", [], |r| r.get::<_, i64>(0)) {
+            return count == 0;
+        }
+    }
+    true
+}
+
+/// 获取本地 inbox 笔记的最早 created_at（用于检测"本地 DB 是新的但 D1 checkpoint 是旧的"）
+fn oldest_note_created_at(db_path: &Path) -> Option<String> {
+    if !db_path.exists() {
+        return None;
+    }
+    if let Ok(conn) = Connection::open(db_path) {
+        if let Ok(ts) = conn.query_row(
+            "SELECT MIN(created_at) FROM notes WHERE created_at IS NOT NULL AND created_at != ''",
+            [],
+            |r| r.get::<_, String>(0),
+        ) {
+            return Some(ts);
+        }
+    }
+    None
+}
+
+/// 获取本地 todo 的最早 created_at
+fn oldest_todo_created_at(db_path: &Path) -> Option<String> {
+    if !db_path.exists() {
+        return None;
+    }
+    if let Ok(conn) = Connection::open(db_path) {
+        if let Ok(ts) = conn.query_row(
+            "SELECT MIN(created_at) FROM todos WHERE created_at IS NOT NULL AND created_at != ''",
+            [],
+            |r| r.get::<_, String>(0),
+        ) {
+            return Some(ts);
+        }
+    }
+    None
+}
+
+/// 判断是否应该执行全量拉取（跳过旧 checkpoint）。
+/// 当本地 DB 为空，或本地最早记录的 created_at > checkpoint 时返回 true。
+/// 这解决了重装软件后本地 DB 被重置但 D1 云端仍有旧 checkpoint 导致拉取不到数据的问题。
+fn should_full_pull(db_path: &Path, checkpoint: Option<&str>, table: &str) -> bool {
+    // 本地 DB 为空 → 全量拉取
+    let empty = match table {
+        "notes" => is_inbox_empty(db_path),
+        "todos" => is_todo_empty(db_path),
+        _ => true,
+    };
+    if empty {
+        info!("📥 本地 {table} 为空，跳过旧 checkpoint 执行全量拉取");
+        return true;
+    }
+
+    // 有 checkpoint 时，检查本地最早记录是否比 checkpoint 更新
+    // 如果是，说明本地 DB 可能被重置过（重装软件），需要全量拉取
+    if let Some(cp) = checkpoint {
+        if !cp.is_empty() {
+            let oldest = match table {
+                "notes" => oldest_note_created_at(db_path),
+                "todos" => oldest_todo_created_at(db_path),
+                _ => None,
+            };
+            if let Some(oldest_ts) = oldest {
+                if oldest_ts > cp.to_string() {
+                    info!("📥 本地 {table} 最早记录 {oldest_ts} 晚于 checkpoint {cp}，疑似重置，执行全量拉取");
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 /// 执行完整的 D1 同步周期（推 + 拉 + 更新状态）
+/// notes/todos 独立同步，一个表失败不影响另一个表
+///
+/// 自动检测本地 DB 是否为空表：若为空则跳过旧 checkpoint，对 pull 操作做全量拉取。
+/// 这解决了重装软件后本地 DB 为空但 D1 云端仍有旧 checkpoint 导致拉取不到数据的问题。
 pub fn sync_d1(
     data_dir: &Path,
     account_id: &str,
@@ -691,21 +858,86 @@ pub fn sync_d1(
     // 1. 初始化表结构
     client.init_schema()?;
 
-    // 2. 获取上次同步时间
-    let last_sync = client.get_last_sync()?;
-
-    // 3. 推送本地变更
     let inbox_path = data_dir.join("inbox.db");
     let todo_path = data_dir.join("todo.db");
-    let pushed_notes = client.push_notes(&inbox_path, last_sync.as_deref())?;
-    let pushed_todos = client.push_todos(&todo_path, last_sync.as_deref())?;
 
-    // 4. 拉取远端变更
-    let inbox_outcome = client.pull_notes(&inbox_path, last_sync.as_deref())?;
-    let todo_outcome = client.pull_todos(&todo_path, last_sync.as_deref())?;
+    // 2. Notes 独立同步
+    // 检测本地 DB 是否"看起来是新的但 D1 checkpoint 是旧的"：
+    // 若本地 inbox 为空，或本地最早笔记的 created_at > checkpoint，
+    // 说明本地 DB 可能被重置过，跳过旧 checkpoint 做全量拉取。
+    let notes_checkpoint = client.get_last_sync("notes")?;
+    let notes_last_sync = if should_full_pull(&inbox_path, notes_checkpoint.as_deref(), "notes") {
+        None
+    } else {
+        notes_checkpoint
+    };
+    let pushed_notes = client.push_notes(&inbox_path, notes_last_sync.as_deref())?;
+    let inbox_outcome = client.pull_notes(&inbox_path, notes_last_sync.as_deref())?;
+    client.update_sync_state("notes")?;
 
-    // 5. 更新同步状态
-    client.update_sync_state()?;
+    // 3. Todos 独立同步
+    let todos_checkpoint = client.get_last_sync("todos")?;
+    let todos_last_sync = if should_full_pull(&todo_path, todos_checkpoint.as_deref(), "todos") {
+        None
+    } else {
+        todos_checkpoint
+    };
+    let pushed_todos = client.push_todos(&todo_path, todos_last_sync.as_deref())?;
+    let todo_outcome = client.pull_todos(&todo_path, todos_last_sync.as_deref())?;
+    client.update_sync_state("todos")?;
+
+    let conflicts = inbox_outcome.archived.len() + todo_outcome.archived.len();
+
+    Ok(D1SyncResult {
+        ok: true,
+        pushed_notes,
+        pushed_todos,
+        pulled_notes: inbox_outcome.created + inbox_outcome.updated + inbox_outcome.deleted,
+        pulled_todos: todo_outcome.created + todo_outcome.updated + todo_outcome.deleted,
+        conflicts,
+        errors: Vec::new(),
+    })
+}
+
+/// 强制全量同步：清空当前设备在 D1 的 checkpoint，然后执行全量拉取。
+/// 用于手动"重置同步"场景（如重装软件后想从云端恢复全部数据）。
+pub fn sync_d1_full(
+    data_dir: &Path,
+    account_id: &str,
+    database_id: &str,
+    api_token: &str,
+    device_id: &str,
+) -> Result<D1SyncResult, String> {
+    let client = D1Client::new(
+        account_id.to_string(),
+        database_id.to_string(),
+        api_token.to_string(),
+        device_id.to_string(),
+    )?;
+
+    // 1. 初始化表结构
+    client.init_schema()?;
+
+    // 2. 清空当前设备的 checkpoint，强制下次拉取为全量
+    info!("🔄 强制全量同步：清空设备 {device_id} 的 sync_state checkpoint");
+    let clear_sql = format!(
+        "DELETE FROM sync_state WHERE device_id = '{}'",
+        escape_sql(device_id)
+    );
+    client.execute(&clear_sql)?;
+
+    let inbox_path = data_dir.join("inbox.db");
+    let todo_path = data_dir.join("todo.db");
+
+    // 3. Notes 全量同步（不传 last_sync = 拉取全部）
+    let pushed_notes = client.push_notes(&inbox_path, None)?;
+    let inbox_outcome = client.pull_notes(&inbox_path, None)?;
+    client.update_sync_state("notes")?;
+
+    // 4. Todos 全量同步
+    let pushed_todos = client.push_todos(&todo_path, None)?;
+    let todo_outcome = client.pull_todos(&todo_path, None)?;
+    client.update_sync_state("todos")?;
 
     let conflicts = inbox_outcome.archived.len() + todo_outcome.archived.len();
 
@@ -795,6 +1027,32 @@ pub fn d1_sync_now(
     )?;
     crate::dbglog::info(format!(
         "[d1] 同步完成: ok={}, pushed={}n/{}t, pulled={}n/{}t, conflicts={}",
+        result.ok,
+        result.pushed_notes,
+        result.pushed_todos,
+        result.pulled_notes,
+        result.pulled_todos,
+        result.conflicts
+    ));
+    Ok(result)
+}
+
+/// 触发一次强制全量 D1 同步（清空 checkpoint 后全量拉取）。
+/// 用于前端"强制全量同步"按钮。
+pub fn d1_sync_now_full(
+    data_dir: &Path,
+    self_id: &str,
+    cfg: &SyncConfig,
+) -> Result<D1SyncResult, String> {
+    let result = sync_d1_full(
+        data_dir,
+        &cfg.d1_account_id,
+        &cfg.d1_database_id,
+        &cfg.d1_api_token,
+        self_id,
+    )?;
+    crate::dbglog::info(format!(
+        "[d1] 强制全量同步完成: ok={}, pushed={}n/{}t, pulled={}n/{}t, conflicts={}",
         result.ok,
         result.pushed_notes,
         result.pushed_todos,

@@ -371,7 +371,7 @@ impl SyncDb {
         for row in rows {
             let (k, v) = row?;
             match k.as_str() {
-                "enabled" | "http_enabled" | "sync_inbox" | "sync_activity" => {
+                "enabled" | "http_enabled" | "sync_inbox" | "sync_activity" | "d1_enabled" => {
                     map.insert(k, serde_json::json!(v == "true"));
                 }
                 "listen_port" | "udp_port" | "probe_interval" => {
