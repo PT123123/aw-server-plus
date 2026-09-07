@@ -226,9 +226,15 @@ async fn main() -> Result<(), rocket::Error> {
             Ok(mgr) => {
                 if let Ok(g) = mgr.lock() {
                     let _ = g.spawn_discovery();
+                    // 在线探测循环（循环内按 enabled 门控；is_online 供自动同步过滤与前端展示）
+                    let _ = g.spawn_probe();
+                    // D1 云同步后台线程（按 d1_sync_interval 周期触发 D1 双向同步）
+                    let _ = g.spawn_d1_sync();
                 }
+                // 局域网自动同步循环（enabled 时按 sync_interval 周期对所有已配对设备双向同步）
+                let _ = aw_sync_rust::SyncManager::spawn_auto_sync(&mgr);
                 rocket = aw_sync_rust::endpoints::mount_rocket(rocket, mgr);
-                info!("局域网同步路由已挂载 (aw-sync-rust)");
+                info!("局域网同步路由已挂载 (aw-sync-rust)，后台线程已启动（发现/探测/自动同步/D1）");
             }
             Err(e) => info!("局域网同步挂载失败(继续启动): {e}"),
         }

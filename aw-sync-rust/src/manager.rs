@@ -1281,13 +1281,17 @@ pub(crate) fn current_local_ip() -> String {
 /// 仅当确实拿到真实局域网地址时返回 Some；失败返回 None（广播线程会跳过假地址）。
 
 fn local_ip() -> Option<String> {
-
     // 直接调用 POSIX getifaddrs（linux / android 均可用），不依赖第三方枚举库，
     // 避免其 Android 分支在新工具链下 CStr::from_ptr 签名不兼容导致编译失败。
 
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
     {
         return None;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        local_ip_windows()
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1356,6 +1360,162 @@ fn local_ip() -> Option<String> {
         }
 
         libc::freeifaddrs(ifap);
+
+        // 私网段优先级：192.168 > 10 > 172.16-31 > 其它私网
+        let rank = |ip: &Ipv4Addr| -> u8 {
+            let o = ip.octets();
+            if o[0] == 192 && o[1] == 168 {
+                3
+            } else if o[0] == 10 {
+                2
+            } else if o[0] == 172 && (o[1] >= 16 && o[1] <= 31) {
+                1
+            } else if ip.is_private() {
+                1
+            } else {
+                0
+            }
+        };
+
+        let pick = |list: &mut Vec<(Ipv4Addr, String)>| -> Option<(String, String)> {
+            list.sort_by(|a, b| rank(&b.0).cmp(&rank(&a.0)));
+            list.first().map(|(ip, name)| (ip.to_string(), name.clone()))
+        };
+
+        let chosen = pick(&mut preferred).or_else(|| pick(&mut others));
+        if let Some((ip, iface)) = chosen {
+            if let Some(slot) = LOCAL_IP_IFACE.get() {
+                if let Ok(mut g) = slot.lock() {
+                    *g = Some(iface);
+                }
+            }
+            Some(ip)
+        } else {
+            None
+        }
+    }
+}
+
+/// Windows 平台：用 GetAdaptersAddresses 枚举网卡，排除 VPN/隧道，
+/// 优先选择 Wi-Fi / 以太网接口的 IPv4 地址。
+#[cfg(target_os = "windows")]
+fn local_ip_windows() -> Option<String> {
+    use std::net::Ipv4Addr;
+    use std::ptr;
+    use windows_sys::Win32::NetworkManagement::IpHelper::GetAdaptersAddresses;
+    use windows_sys::Win32::NetworkManagement::IpHelper::GAA_FLAG_INCLUDE_PREFIX;
+    use windows_sys::Win32::Networking::WinSock::AF_INET;
+
+    unsafe {
+        let family = AF_INET as u32;
+        let flags: u32 = GAA_FLAG_INCLUDE_PREFIX;
+        let mut size: u32 = 0;
+
+        let mut adapters_buffer: Vec<u8> = Vec::with_capacity(15000);
+
+        let mut ret = GetAdaptersAddresses(
+            family,
+            flags,
+            ptr::null_mut(),
+            adapters_buffer.as_mut_ptr() as *mut _,
+            &mut size,
+        );
+
+        if ret == 112 {
+            // ERROR_INSUFFICIENT_BUFFER - 重新分配
+            adapters_buffer = Vec::with_capacity(size as usize);
+            ret = GetAdaptersAddresses(
+                family,
+                flags,
+                ptr::null_mut(),
+                adapters_buffer.as_mut_ptr() as *mut _,
+                &mut size,
+            );
+        }
+
+        if ret != 0 {
+            return None;
+        }
+
+        let mut preferred: Vec<(Ipv4Addr, String)> = Vec::new();
+        let mut others: Vec<(Ipv4Addr, String)> = Vec::new();
+
+        let mut adapter = adapters_buffer.as_ptr() as *const windows_sys::Win32::NetworkManagement::IpHelper::IP_ADAPTER_ADDRESSES_LH;
+
+        while !adapter.is_null() {
+            let ifa = &*adapter;
+
+            // 跳过环回、未连接、虚拟接口
+            let if_type = ifa.IfType;
+            // IF_TYPE_SOFTWARE_LOOPBACK = 24, IF_TYPE_TUNNEL = 13
+            if if_type == 24 || if_type == 13 {
+                adapter = ifa.Next;
+                continue;
+            }
+
+            // 检查接口是否已连接（IfOperStatusUp = 1）
+            if ifa.OperStatus != 1 {
+                adapter = ifa.Next;
+                continue;
+            }
+
+            // 获取单播地址列表
+            let mut unicast = ifa.FirstUnicastAddress;
+            while !unicast.is_null() {
+                let addr = &*unicast;
+                let sockaddr = addr.Address.lpSockaddr;
+
+                if !sockaddr.is_null() {
+                    let family = (*sockaddr).sa_family;
+                    if family == AF_INET as u16 {
+                        let sin = sockaddr as *const windows_sys::Win32::Networking::WinSock::SOCKADDR_IN;
+                        let s_addr = (*sin).sin_addr.S_un.S_addr;
+                        // Windows stores in network byte order
+                        let ip = Ipv4Addr::from(u32::from_be(s_addr));
+
+                        // 跳过回环 / 未指定 / 链路本地
+                        if !ip.is_loopback() && !ip.is_unspecified() && !ip.is_link_local() {
+                            // 获取接口友好名称（Windows FriendlyName 是 UTF-16 宽字符串）
+                            let name = {
+                                let len = (0..).take_while(|&i| ifa.FriendlyName.add(i).read() != 0).count();
+                                let slice = std::slice::from_raw_parts(ifa.FriendlyName, len);
+                                String::from_utf16_lossy(slice).to_ascii_lowercase()
+                            };
+
+                            // 跳过 VPN / 隧道接口
+                            let is_vpn = name.contains("vpn")
+                                || name.contains("tap")
+                                || name.contains("tunnel")
+                                || name.contains("virtual")
+                                || name.contains("hyper-v")
+                                || name.contains("virtualbox")
+                                || name.contains("vmware");
+
+                            if is_vpn {
+                                unicast = addr.Next;
+                                continue;
+                            }
+
+                            // 优先 Wi-Fi / 以太网接口
+                            let is_preferred = name.contains("wi-fi")
+                                || name.contains("wifi")
+                                || name.contains("wlan")
+                                || name.contains("ethernet")
+                                || name.contains("eth")
+                                || name.contains("local area connection");
+
+                            if is_preferred {
+                                preferred.push((ip, name));
+                            } else {
+                                others.push((ip, name));
+                            }
+                        }
+                    }
+                }
+                unicast = addr.Next;
+            }
+            adapter = ifa.Next;
+        }
 
         // 私网段优先级：192.168 > 10 > 172.16-31 > 其它私网
         let rank = |ip: &Ipv4Addr| -> u8 {
