@@ -1421,8 +1421,8 @@ fn local_ip_windows() -> Option<String> {
             &mut size,
         );
 
-        if ret == 112 {
-            // ERROR_INSUFFICIENT_BUFFER - 重新分配
+        if ret == 111 {
+            // ERROR_BUFFER_OVERFLOW - 缓冲区不足，按返回的 size 重新分配
             adapters_buffer = Vec::with_capacity(size as usize);
             ret = GetAdaptersAddresses(
                 family,
