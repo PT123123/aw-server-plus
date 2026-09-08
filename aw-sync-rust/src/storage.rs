@@ -60,6 +60,8 @@ impl SyncDb {
                 archived TEXT NOT NULL, winner_rev TEXT, reason TEXT NOT NULL,
                 source_device TEXT, archived_at TEXT NOT NULL,
                 restored INTEGER NOT NULL DEFAULT 0);
+            CREATE INDEX IF NOT EXISTS idx_sync_log_filter
+                ON sync_log(direction, protocol, event_type, id);
             COMMIT;",
         )?;
         // 幂等加列（老库升级）
@@ -67,6 +69,12 @@ impl SyncDb {
         self.ensure_column("devices", "alias", "ALTER TABLE devices ADD COLUMN alias TEXT");
         self.ensure_column("devices", "last_seen_at", "ALTER TABLE devices ADD COLUMN last_seen_at TEXT");
         self.ensure_column("sync_log", "details", "ALTER TABLE sync_log ADD COLUMN details TEXT");
+        // 老库瘦身：sync_log 从不自动截断会膨胀到数万行，拖垮 /log 查询；保留最近 500 条
+        if self.log_count().unwrap_or(0) > 500 {
+            if let Err(e) = self.truncate_logs(500) {
+                log::warn!("[aw-sync] migrate 截断 sync_log 失败: {e}");
+            }
+        }
         Ok(())
     }
 
@@ -258,7 +266,15 @@ impl SyncDb {
                 e.data_size.map(|s| s as i64), details_json,
             ],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let id = self.conn.last_insert_rowid();
+        // 自动截断：每写 100 条检查一次，把 sync_log 稳定在 ~600 行内，
+        // 避免 /log 的 COUNT(*) 与过滤查询随表膨胀击穿客户端读超时
+        if id % 100 == 0 {
+            if let Err(e) = self.truncate_logs(500) {
+                log::warn!("[aw-sync] 自动截断 sync_log 失败: {e}");
+            }
+        }
+        Ok(id)
     }
 
     pub fn get_logs(&self, f: &LogFilter) -> Result<Vec<SyncLogEntry>> {

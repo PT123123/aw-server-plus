@@ -260,6 +260,10 @@ pub fn export_inbox(db_path: &Path) -> Result<String, String> {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TodoExport {
     pub todos: Vec<TodoRow>,
+    /// 清单表（与 tag 独立）。None = 老版本导出（无此字段），导入时跳过清单合并；
+    /// Some(vec) = 全量清单，导入时整表替换（保证删除可传播）。
+    #[serde(default)]
+    pub lists: Option<Vec<TodoListRow>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,6 +282,12 @@ pub struct TodoRow {
     pub due_date: Option<String>,
     #[serde(default)]
     pub tags: String,
+    /// todos.subtasks JSON 文本（原样存储，同步链路不解析内部结构）
+    #[serde(default)]
+    pub subtasks: String,
+    /// 清单 id（引用 todo_lists.id，跨设备保真）
+    #[serde(default)]
+    pub list_id: i64,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default)]
@@ -292,12 +302,25 @@ pub struct TodoRow {
     pub synced_at: Option<String>,
 }
 
+/// 清单行（todo_lists 表）。id 是 todo.list_id 的引用键，跨设备必须保真。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodoListRow {
+    pub id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub color: String,
+    #[serde(default)]
+    pub sort_order: i64,
+    #[serde(default)]
+    pub uuid: String,
+}
+
 /// 导出 Todo 库(todo.db)为 JSON 文本（含已软删除的行，保证删除状态可同步）
 pub fn export_todo(db_path: &Path) -> Result<String, String> {
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT id,uuid,title,content,completed,priority,due_date,tags,created_at,updated_at,
+            "SELECT id,uuid,title,content,completed,priority,due_date,tags,subtasks,list_id,created_at,updated_at,
                     completed_at,version,device_id,deleted,synced_at FROM todos",
         )
         .map_err(|e| e.to_string())?;
@@ -312,13 +335,15 @@ pub fn export_todo(db_path: &Path) -> Result<String, String> {
                 priority: r.get(5)?,
                 due_date: r.get(6)?,
                 tags: r.get(7)?,
-                created_at: r.get(8)?,
-                updated_at: r.get(9)?,
-                completed_at: r.get(10)?,
-                version: r.get(11)?,
-                device_id: r.get(12)?,
-                deleted: r.get(13)?,
-                synced_at: r.get(14)?,
+                subtasks: r.get(8)?,
+                list_id: r.get(9)?,
+                created_at: r.get(10)?,
+                updated_at: r.get(11)?,
+                completed_at: r.get(12)?,
+                version: r.get(13)?,
+                device_id: r.get(14)?,
+                deleted: r.get(15)?,
+                synced_at: r.get(16)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -326,7 +351,31 @@ pub fn export_todo(db_path: &Path) -> Result<String, String> {
     for row in rows {
         todos.push(row.map_err(|e| e.to_string())?);
     }
-    serde_json::to_string(&TodoExport { todos }).map_err(|e| e.to_string())
+
+    // 清单表（老库可能还没有 todo_lists 表 → 空列表）
+    let mut lists = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT id,name,color,sort_order,uuid FROM todo_lists") {
+        let rows = stmt.query_map([], |r| {
+            Ok(TodoListRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                color: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                sort_order: r.get(3)?,
+                uuid: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            })
+        });
+        if let Ok(rows) = rows {
+            for row in rows {
+                lists.push(row.map_err(|e| e.to_string())?);
+            }
+        }
+    }
+
+    serde_json::to_string(&TodoExport {
+        todos,
+        lists: Some(lists),
+    })
+    .map_err(|e| e.to_string())
 }
 
 // ---- Schema helpers ----
@@ -361,6 +410,20 @@ fn backfill_uuid(conn: &Connection, table: &str) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// 确保清单表存在（老库升级用）
+fn ensure_todo_lists_table(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS todo_lists (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            color TEXT DEFAULT '',
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            uuid TEXT);",
+    )
+    .map_err(|e| format!("ensure todo_lists schema failed: {e}"))?;
+    ensure_column(conn, "todo_lists", "uuid", "TEXT")
 }
 
 fn logical_key(uuid: &str, fallback_id: i64) -> String {
@@ -576,13 +639,16 @@ pub fn import_todo(db_path: &Path, json: &str) -> Result<ImportOutcome, String> 
     )
     .map_err(|e| format!("ensure todo schema failed: {e}"))?;
     ensure_column(&conn, "todos", "uuid", "TEXT")?;
+    ensure_column(&conn, "todos", "subtasks", "TEXT NOT NULL DEFAULT '[]'")?;
+    ensure_column(&conn, "todos", "list_id", "INTEGER NOT NULL DEFAULT 0")?;
     backfill_uuid(&conn, "todos")?;
+    ensure_todo_lists_table(&conn)?;
 
     let mut local: HashMap<String, TodoRow> = HashMap::new();
     {
         let mut stmt = conn
             .prepare(
-                "SELECT id,uuid,title,content,completed,priority,due_date,tags,created_at,updated_at,
+                "SELECT id,uuid,title,content,completed,priority,due_date,tags,subtasks,list_id,created_at,updated_at,
                         completed_at,version,device_id,deleted,synced_at FROM todos",
             )
             .map_err(|e| e.to_string())?;
@@ -597,13 +663,15 @@ pub fn import_todo(db_path: &Path, json: &str) -> Result<ImportOutcome, String> 
                     priority: r.get(5)?,
                     due_date: r.get(6)?,
                     tags: r.get(7)?,
-                    created_at: r.get(8)?,
-                    updated_at: r.get(9)?,
-                    completed_at: r.get(10)?,
-                    version: r.get(11)?,
-                    device_id: r.get(12)?,
-                    deleted: r.get(13)?,
-                    synced_at: r.get(14)?,
+                    subtasks: r.get(8)?,
+                    list_id: r.get(9)?,
+                    created_at: r.get(10)?,
+                    updated_at: r.get(11)?,
+                    completed_at: r.get(12)?,
+                    version: r.get(13)?,
+                    device_id: r.get(14)?,
+                    deleted: r.get(15)?,
+                    synced_at: r.get(16)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -623,7 +691,9 @@ pub fn import_todo(db_path: &Path, json: &str) -> Result<ImportOutcome, String> 
                     && lt.content == t.content
                     && lt.completed == t.completed
                     && lt.deleted == t.deleted
-                    && lt.tags == t.tags;
+                    && lt.tags == t.tags
+                    && lt.subtasks == t.subtasks
+                    && lt.list_id == t.list_id;
                 if same {
                     out.ignored_dup += 1;
                     out.records.push(transfer_from_todo(t, "ignored_dup", None));
@@ -649,8 +719,8 @@ pub fn import_todo(db_path: &Path, json: &str) -> Result<ImportOutcome, String> 
                     });
                     tx.execute(
                         "UPDATE todos SET title=?1,content=?2,completed=?3,priority=?4,due_date=?5,
-                           tags=?6,created_at=?7,updated_at=?8,completed_at=?9,version=?10,
-                           device_id=?11,deleted=?12,synced_at=?13 WHERE uuid=?14",
+                           tags=?6,subtasks=?7,list_id=?8,created_at=?9,updated_at=?10,completed_at=?11,version=?12,
+                           device_id=?13,deleted=?14,synced_at=?15 WHERE uuid=?16",
                         rusqlite::params![
                             t.title,
                             t.content,
@@ -658,6 +728,8 @@ pub fn import_todo(db_path: &Path, json: &str) -> Result<ImportOutcome, String> 
                             t.priority,
                             t.due_date,
                             t.tags,
+                            t.subtasks,
+                            t.list_id,
                             t.created_at,
                             t.updated_at,
                             t.completed_at,
@@ -690,9 +762,9 @@ pub fn import_todo(db_path: &Path, json: &str) -> Result<ImportOutcome, String> 
             }
             None => {
                 tx.execute(
-                    "INSERT INTO todos (uuid,title,content,completed,priority,due_date,tags,
+                    "INSERT INTO todos (uuid,title,content,completed,priority,due_date,tags,subtasks,list_id,
                                         created_at,updated_at,completed_at,version,device_id,deleted,synced_at)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                     rusqlite::params![
                         key,
                         t.title,
@@ -701,6 +773,8 @@ pub fn import_todo(db_path: &Path, json: &str) -> Result<ImportOutcome, String> 
                         t.priority,
                         t.due_date,
                         t.tags,
+                        t.subtasks,
+                        t.list_id,
                         t.created_at,
                         t.updated_at,
                         t.completed_at,
@@ -714,6 +788,19 @@ pub fn import_todo(db_path: &Path, json: &str) -> Result<ImportOutcome, String> 
                 out.created += 1;
                 out.records.push(transfer_from_todo(t, "created", None));
             }
+        }
+    }
+
+    // 清单合并：Some = 全量整表替换（id 保真，todo.list_id 引用不失效；空列表也替换，保证删除传播）
+    if let Some(lists) = &data.lists {
+        tx.execute("DELETE FROM todo_lists", [])
+            .map_err(|e| e.to_string())?;
+        for l in lists {
+            tx.execute(
+                "INSERT INTO todo_lists (id,name,color,sort_order,uuid) VALUES (?1,?2,?3,?4,?5)",
+                rusqlite::params![l.id, l.name, l.color, l.sort_order, l.uuid],
+            )
+            .map_err(|e| e.to_string())?;
         }
     }
 
@@ -951,6 +1038,8 @@ pub fn restore_todo(db_path: &Path, json: &str) -> Result<bool, String> {
     )
     .map_err(|e| format!("ensure todo schema failed: {e}"))?;
     ensure_column(&conn, "todos", "uuid", "TEXT")?;
+    ensure_column(&conn, "todos", "subtasks", "TEXT NOT NULL DEFAULT '[]'")?;
+    ensure_column(&conn, "todos", "list_id", "INTEGER NOT NULL DEFAULT 0")?;
     backfill_uuid(&conn, "todos")?;
     let key = logical_key(&t.uuid, t.id);
     let exists: i64 = conn

@@ -118,6 +118,52 @@ pub struct CreateCommentPayload {
 
 // ── Todo ───────────────────────────────────────────────────────
 
+/// 子任务项（存储为 todos.subtasks JSON 列的元素；id 由客户端分配，服务端原样存储）
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TodoSubtaskItem {
+    pub id: i64,
+    pub title: String,
+    #[serde(default)]
+    pub completed: bool,
+}
+
+/// 清单记录（todo_lists 表；清单与 tag 是两个独立概念）
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TodoListRecord {
+    pub id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub color: String,
+    #[serde(default)]
+    pub sort_order: i64,
+    #[serde(default)]
+    pub uuid: String,
+}
+
+#[derive(Serialize, Debug)]
+pub struct TodoListResponse {
+    pub id: i64,
+    pub name: String,
+    pub color: String,
+    pub sort_order: i64,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct CreateTodoListPayload {
+    pub name: String,
+    #[serde(default)]
+    pub color: String,
+    #[serde(default)]
+    pub sort_order: i64,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct UpdateTodoListPayload {
+    pub name: Option<String>,
+    pub color: Option<String>,
+    pub sort_order: Option<i64>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Todo {
     pub id: i64,
@@ -127,6 +173,10 @@ pub struct Todo {
     pub priority: Option<i64>,
     pub due_date: Option<DateTime<Utc>>,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub subtasks: Vec<TodoSubtaskItem>,
+    #[serde(default)]
+    pub list_id: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
@@ -145,6 +195,8 @@ pub struct TodoResponse {
     pub priority: Option<i64>,
     pub due_date: Option<String>,
     pub tags: Vec<String>,
+    pub subtasks: Vec<TodoSubtaskItem>,
+    pub list_id: i64,
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
@@ -162,6 +214,10 @@ pub struct CreateTodoPayload {
     pub priority: Option<i64>,
     pub due_date: Option<DateTime<Utc>>,
     pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub subtasks: Option<Vec<TodoSubtaskItem>>,
+    #[serde(default)]
+    pub list_id: Option<i64>,
     pub created_at: Option<DateTime<Utc>>,
 }
 
@@ -173,6 +229,8 @@ pub struct UpdateTodoPayload {
     pub priority: Option<i64>,
     pub due_date: Option<DateTime<Utc>>,
     pub tags: Option<Vec<String>>,
+    pub subtasks: Option<Vec<TodoSubtaskItem>>,
+    pub list_id: Option<i64>,
 }
 
 // ── Note History ───────────────────────────────────────────────

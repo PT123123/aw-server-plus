@@ -1,8 +1,8 @@
 // src/db.rs
 use crate::models::{
-    CreateCommentPayload, CreateNotePayload, CreateNoteRelationPayload, CreateTodoPayload,
-    DetailedTag, Note, NoteRelation, NoteRelationType, TagNode, Todo, UpdateNotePayload,
-    UpdateTodoPayload,
+    CreateCommentPayload, CreateNotePayload, CreateNoteRelationPayload, CreateTodoListPayload,
+    CreateTodoPayload, DetailedTag, Note, NoteRelation, NoteRelationType, TagNode, Todo,
+    TodoListRecord, UpdateNotePayload, UpdateTodoListPayload, UpdateTodoPayload,
 }; // Updated imports
 use chrono::{DateTime, Utc};
 use log::{info, warn};
@@ -229,9 +229,29 @@ pub fn migrate_todo(conn: &DbConnection) -> Result<(), Error> {
     ensure_column(conn, "todos", "deleted", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "todos", "synced_at", "TEXT")?;
     ensure_column(conn, "todos", "uuid", "TEXT")?;
+    ensure_column(conn, "todos", "subtasks", "TEXT NOT NULL DEFAULT '[]'")?;
+    ensure_column(conn, "todos", "list_id", "INTEGER NOT NULL DEFAULT 0")?;
     // 为历史行补齐 uuid（P0 同步逻辑键）
     conn.execute(
         "UPDATE todos SET uuid = lower(hex(randomblob(16))) WHERE uuid IS NULL OR uuid = ''",
+        [],
+    )?;
+
+    // 清单表（清单与 tag 是两个独立概念；todo_lists 随 todo.db 一起参与同步）
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS todo_lists (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            color TEXT DEFAULT '',
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            uuid TEXT
+        );
+        "#,
+    )?;
+    ensure_column(conn, "todo_lists", "uuid", "TEXT")?;
+    conn.execute(
+        "UPDATE todo_lists SET uuid = lower(hex(randomblob(16))) WHERE uuid IS NULL OR uuid = ''",
         [],
     )?;
 
@@ -949,6 +969,9 @@ pub fn add_comment_db(
 fn map_row_to_todo(row: &rusqlite::Row) -> Result<Todo, Error> {
     let tags_json: String = row.get("tags")?;
     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+    let subtasks_json: String = row.get("subtasks")?;
+    let subtasks: Vec<crate::models::TodoSubtaskItem> =
+        serde_json::from_str(&subtasks_json).unwrap_or_default();
     let created_at: DateTime<Utc> = row.get("created_at")?;
     let updated_at: DateTime<Utc> = row.get("updated_at")?;
     let completed: i64 = row.get("completed")?;
@@ -962,6 +985,8 @@ fn map_row_to_todo(row: &rusqlite::Row) -> Result<Todo, Error> {
         priority: row.get("priority")?,
         due_date: row.get("due_date")?,
         tags,
+        subtasks,
+        list_id: row.get("list_id")?,
         created_at,
         updated_at,
         completed_at: row.get("completed_at")?,
@@ -981,6 +1006,9 @@ pub fn create_todo_db(
     let updated_at = created_at;
     let tags_json =
         serde_json::to_string(&payload.tags.unwrap_or_default()).map_err(map_serde_error)?;
+    let subtasks_json =
+        serde_json::to_string(&payload.subtasks.unwrap_or_default()).map_err(map_serde_error)?;
+    let list_id = payload.list_id.unwrap_or(0);
 
     let tx = conn.transaction()?;
     let global_version: i64 = tx.query_row(
@@ -991,9 +1019,9 @@ pub fn create_todo_db(
 
     tx.execute(
         r#"
-        INSERT INTO todos (uuid, title, content, completed, priority, due_date, tags,
+        INSERT INTO todos (uuid, title, content, completed, priority, due_date, tags, subtasks, list_id,
                            created_at, updated_at, completed_at, version, device_id, deleted, synced_at)
-        VALUES (lower(hex(randomblob(16))), ?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, 0, ?10)
+        VALUES (lower(hex(randomblob(16))), ?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, 0, ?12)
         "#,
         params![
             payload.title,
@@ -1001,6 +1029,8 @@ pub fn create_todo_db(
             payload.priority,
             payload.due_date,
             tags_json,
+            subtasks_json,
+            list_id,
             created_at,
             updated_at,
             global_version,
@@ -1013,6 +1043,8 @@ pub fn create_todo_db(
     tx.commit()?;
 
     let parsed_tags: Vec<String> = serde_json::from_str(&tags_json).map_err(map_serde_error)?;
+    let parsed_subtasks: Vec<crate::models::TodoSubtaskItem> =
+        serde_json::from_str(&subtasks_json).map_err(map_serde_error)?;
 
     Ok(Todo {
         id,
@@ -1022,6 +1054,8 @@ pub fn create_todo_db(
         priority: payload.priority,
         due_date: payload.due_date,
         tags: parsed_tags,
+        subtasks: parsed_subtasks,
+        list_id,
         created_at,
         updated_at,
         completed_at: None,
@@ -1039,7 +1073,7 @@ pub fn get_todos_db(
     offset: Option<i64>,
 ) -> Result<Vec<Todo>, Error> {
     let mut sql = String::from(
-        "SELECT id, title, content, completed, priority, due_date, tags,
+        "SELECT id, title, content, completed, priority, due_date, tags, subtasks, list_id,
                 created_at, updated_at, completed_at, version, device_id, deleted, synced_at
          FROM todos WHERE deleted = 0",
     );
@@ -1065,7 +1099,7 @@ pub fn get_todos_db(
 
 pub fn get_todo_by_id_db(conn: &DbConnection, todo_id: i64) -> Result<Todo, Error> {
     let todo = conn.query_row(
-        "SELECT id, title, content, completed, priority, due_date, tags,
+        "SELECT id, title, content, completed, priority, due_date, tags, subtasks, list_id,
                 created_at, updated_at, completed_at, version, device_id, deleted, synced_at
          FROM todos WHERE id = ?1",
         params![todo_id],
@@ -1088,6 +1122,9 @@ pub fn update_todo_db(
     let due_date = payload.due_date.or(existing.due_date);
     let tags = payload.tags.unwrap_or(existing.tags);
     let tags_json = serde_json::to_string(&tags).map_err(map_serde_error)?;
+    let subtasks = payload.subtasks.unwrap_or(existing.subtasks);
+    let subtasks_json = serde_json::to_string(&subtasks).map_err(map_serde_error)?;
+    let list_id = payload.list_id.unwrap_or(existing.list_id);
 
     let (completed, completed_at) = if let Some(c) = payload.completed {
         if c && !existing.completed {
@@ -1112,8 +1149,9 @@ pub fn update_todo_db(
         r#"
         UPDATE todos SET
             title = ?1, content = ?2, completed = ?3, priority = ?4,
-            due_date = ?5, tags = ?6, updated_at = ?7, completed_at = ?8, version = ?9
-        WHERE id = ?10
+            due_date = ?5, tags = ?6, subtasks = ?7, list_id = ?8,
+            updated_at = ?9, completed_at = ?10, version = ?11
+        WHERE id = ?12
         "#,
         params![
             title,
@@ -1122,6 +1160,8 @@ pub fn update_todo_db(
             priority,
             due_date,
             tags_json,
+            subtasks_json,
+            list_id,
             updated_at,
             completed_at,
             global_version,
@@ -1138,6 +1178,8 @@ pub fn update_todo_db(
         priority,
         due_date,
         tags,
+        subtasks,
+        list_id,
         created_at: existing.created_at,
         updated_at,
         completed_at,
@@ -1217,4 +1259,91 @@ pub fn restore_todo_db(conn: &mut DbConnection, todo_id: i64) -> Result<Option<T
     } else {
         Ok(None)
     }
+}
+
+// ── Todo List CRUD（清单与 tag 独立；todo_lists 随 todo.db 参与同步） ──
+
+fn map_row_to_todo_list(row: &rusqlite::Row) -> Result<TodoListRecord, Error> {
+    Ok(TodoListRecord {
+        id: row.get("id")?,
+        name: row.get("name")?,
+        color: row.get::<_, Option<String>>("color")?.unwrap_or_default(),
+        sort_order: row.get("sort_order")?,
+        uuid: row.get::<_, Option<String>>("uuid")?.unwrap_or_default(),
+    })
+}
+
+pub fn get_todo_lists_db(conn: &DbConnection) -> Result<Vec<TodoListRecord>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, color, sort_order, uuid FROM todo_lists ORDER BY sort_order ASC, id ASC",
+    )?;
+    let rows = stmt.query_map([], map_row_to_todo_list)?;
+    let mut lists = Vec::new();
+    for r in rows {
+        lists.push(r?);
+    }
+    Ok(lists)
+}
+
+pub fn create_todo_list_db(
+    conn: &mut DbConnection,
+    payload: CreateTodoListPayload,
+) -> Result<TodoListRecord, Error> {
+    let name = payload.name.trim().to_string();
+    if name.is_empty() {
+        return Err(Error::from(rusqlite::Error::InvalidQuery));
+    }
+    conn.execute(
+        "INSERT INTO todo_lists (name, color, sort_order, uuid)
+         VALUES (?1, ?2, ?3, lower(hex(randomblob(16))))",
+        params![name, payload.color, payload.sort_order],
+    )?;
+    let id = conn.last_insert_rowid();
+    Ok(TodoListRecord {
+        id,
+        name,
+        color: payload.color,
+        sort_order: payload.sort_order,
+        uuid: String::new(),
+    })
+}
+
+pub fn update_todo_list_db(
+    conn: &mut DbConnection,
+    list_id: i64,
+    payload: UpdateTodoListPayload,
+) -> Result<Option<TodoListRecord>, Error> {
+    let existing = conn
+        .query_row(
+            "SELECT id, name, color, sort_order, uuid FROM todo_lists WHERE id = ?1",
+            params![list_id],
+            map_row_to_todo_list,
+        )
+        .optional()?;
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    let name = payload.name.map(|n| n.trim().to_string()).unwrap_or(existing.name);
+    let color = payload.color.unwrap_or(existing.color);
+    let sort_order = payload.sort_order.unwrap_or(existing.sort_order);
+    conn.execute(
+        "UPDATE todo_lists SET name = ?1, color = ?2, sort_order = ?3 WHERE id = ?4",
+        params![name, color, sort_order, list_id],
+    )?;
+    Ok(Some(TodoListRecord {
+        id: list_id,
+        name,
+        color,
+        sort_order,
+        uuid: existing.uuid,
+    }))
+}
+
+/// 删除清单：其下任务的 list_id 归零（回收集箱），任务本身不删除。
+pub fn delete_todo_list_db(conn: &mut DbConnection, list_id: i64) -> Result<bool, Error> {
+    let tx = conn.transaction()?;
+    tx.execute("UPDATE todos SET list_id = 0 WHERE list_id = ?1", params![list_id])?;
+    let rows = tx.execute("DELETE FROM todo_lists WHERE id = ?1", params![list_id])?;
+    tx.commit()?;
+    Ok(rows > 0)
 }

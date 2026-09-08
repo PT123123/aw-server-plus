@@ -24,7 +24,7 @@ use serde_json::Value;
 
 use crate::models::SyncConfig;
 use crate::serialize::{
-    ImportOutcome, InboxExport, NoteRow, RelationRow, TodoExport, TodoRow,
+    ImportOutcome, InboxExport, NoteRow, RelationRow, TodoExport, TodoListRow, TodoRow,
     export_inbox, export_todo, import_inbox, import_todo,
 };
 
@@ -446,6 +446,8 @@ impl D1Client {
                 priority INTEGER,
                 due_date TEXT,
                 tags TEXT DEFAULT '[]',
+                subtasks TEXT NOT NULL DEFAULT '[]',
+                list_id INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 completed_at TEXT,
@@ -454,12 +456,22 @@ impl D1Client {
                 deleted INTEGER NOT NULL DEFAULT 0,
                 synced_at TEXT
             )"#,
+            r#"CREATE TABLE IF NOT EXISTS todo_lists (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                color TEXT DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                uuid TEXT
+            )"#,
             r#"CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at)"#,
             r#"CREATE INDEX IF NOT EXISTS idx_todos_updated ON todos(updated_at)"#,
         ];
         for sql in statements {
             self.query(sql)?;
         }
+        // 老远端表补列（幂等：列已存在时报错，忽略即可）
+        let _ = self.execute("ALTER TABLE todos ADD COLUMN subtasks TEXT NOT NULL DEFAULT '[]'");
+        let _ = self.execute("ALTER TABLE todos ADD COLUMN list_id INTEGER NOT NULL DEFAULT 0");
         // sync_state: 迁移到新结构 (device_id, table_name) 复合 PK
         self.migrate_sync_state()?;
         info!("✅ D1 数据库表结构初始化完成");
@@ -580,11 +592,12 @@ impl D1Client {
                 }
             }
             let sql = format!(
-                "INSERT INTO todos (uuid,title,content,completed,priority,due_date,tags,created_at,updated_at,completed_at,version,device_id,deleted,synced_at) \
-                 VALUES ('{}','{}','{}',{},{},'{}','{}','{}','{}','{}',{},'{}',{},'{}') \
+                "INSERT INTO todos (uuid,title,content,completed,priority,due_date,tags,subtasks,list_id,created_at,updated_at,completed_at,version,device_id,deleted,synced_at) \
+                 VALUES ('{}','{}','{}',{},{},'{}','{}','{}',{},'{}','{}','{}',{},'{}',{},'{}') \
                  ON CONFLICT(uuid) DO UPDATE SET \
                    title=excluded.title, content=excluded.content, completed=excluded.completed, \
                    priority=excluded.priority, due_date=excluded.due_date, tags=excluded.tags, \
+                   subtasks=excluded.subtasks, list_id=excluded.list_id, \
                    created_at=excluded.created_at, updated_at=excluded.updated_at, \
                    completed_at=excluded.completed_at, version=excluded.version, device_id=excluded.device_id, \
                    deleted=excluded.deleted, synced_at=excluded.synced_at \
@@ -596,6 +609,8 @@ impl D1Client {
                 t.priority.unwrap_or(0),
                 escape_sql(t.due_date.as_deref().unwrap_or("")),
                 escape_sql(&t.tags),
+                escape_sql(&t.subtasks),
+                t.list_id,
                 escape_sql(&t.created_at),
                 escape_sql(&t.updated_at),
                 escape_sql(t.completed_at.as_deref().unwrap_or("")),
@@ -606,6 +621,22 @@ impl D1Client {
             );
             self.execute(&sql)?;
             pushed += 1;
+        }
+
+        // 清单全量推送（小表，整表替换保证删除可传播；id 保真）
+        if let Some(lists) = &data.lists {
+            self.execute("DELETE FROM todo_lists")?;
+            for l in lists {
+                let sql = format!(
+                    "INSERT INTO todo_lists (id,name,color,sort_order,uuid) VALUES ({},'{}','{}',{},'{}')",
+                    l.id,
+                    escape_sql(&l.name),
+                    escape_sql(&l.color),
+                    l.sort_order,
+                    escape_sql(&l.uuid)
+                );
+                self.execute(&sql)?;
+            }
         }
 
         info!("📤 D1 推送 TODO: {pushed} 条");
@@ -667,8 +698,8 @@ impl D1Client {
     /// 从 D1 拉取 TODO（增量）
     pub fn pull_todos(&self, db_path: &Path, last_sync: Option<&str>) -> Result<ImportOutcome, String> {
         let sql = match last_sync {
-            Some(ls) => format!("SELECT uuid,title,content,completed,priority,due_date,tags,created_at,updated_at,completed_at,version,device_id,deleted,synced_at FROM todos WHERE updated_at > '{}' ORDER BY updated_at", escape_sql(ls)),
-            None => "SELECT uuid,title,content,completed,priority,due_date,tags,created_at,updated_at,completed_at,version,device_id,deleted,synced_at FROM todos ORDER BY updated_at".to_string(),
+            Some(ls) => format!("SELECT uuid,title,content,completed,priority,due_date,tags,subtasks,list_id,created_at,updated_at,completed_at,version,device_id,deleted,synced_at FROM todos WHERE updated_at > '{}' ORDER BY updated_at", escape_sql(ls)),
+            None => "SELECT uuid,title,content,completed,priority,due_date,tags,subtasks,list_id,created_at,updated_at,completed_at,version,device_id,deleted,synced_at FROM todos ORDER BY updated_at".to_string(),
         };
 
         let resp = self.raw(&sql)?;
@@ -683,17 +714,34 @@ impl D1Client {
                 priority: row.get(4).and_then(|v| v.as_i64()),
                 due_date: row.get(5).and_then(|v| v.as_str()).map(|s| s.to_string()),
                 tags: row.get(6).and_then(|v| v.as_str()).unwrap_or("[]").to_string(),
-                created_at: row.get(7).and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                updated_at: row.get(8).and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                completed_at: row.get(9).and_then(|v| v.as_str()).map(|s| s.to_string()),
-                version: row.get(10).and_then(|v| v.as_i64()).unwrap_or(1),
-                device_id: row.get(11).and_then(|v| v.as_str()).map(|s| s.to_string()),
-                deleted: row.get(12).and_then(|v| v.as_i64()).unwrap_or(0),
-                synced_at: row.get(13).and_then(|v| v.as_str()).map(|s| s.to_string()),
+                subtasks: row.get(7).and_then(|v| v.as_str()).unwrap_or("[]").to_string(),
+                list_id: row.get(8).and_then(|v| v.as_i64()).unwrap_or(0),
+                created_at: row.get(9).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                updated_at: row.get(10).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                completed_at: row.get(11).and_then(|v| v.as_str()).map(|s| s.to_string()),
+                version: row.get(12).and_then(|v| v.as_i64()).unwrap_or(1),
+                device_id: row.get(13).and_then(|v| v.as_str()).map(|s| s.to_string()),
+                deleted: row.get(14).and_then(|v| v.as_i64()).unwrap_or(0),
+                synced_at: row.get(15).and_then(|v| v.as_str()).map(|s| s.to_string()),
             });
         }
 
-        let todo_export = TodoExport { todos };
+        // 拉取清单（全量；远端表可能还没建 → 当作空清单）
+        let list_sql = "SELECT id,name,color,sort_order,uuid FROM todo_lists".to_string();
+        let mut lists: Vec<TodoListRow> = Vec::new();
+        if let Ok(list_resp) = self.raw(&list_sql) {
+            for row in list_resp.first_results().map(|r| r.rows.as_slice()).unwrap_or(&[]) {
+                lists.push(TodoListRow {
+                    id: row.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                    name: row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    color: row.get(2).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    sort_order: row.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
+                    uuid: row.get(4).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                });
+            }
+        }
+
+        let todo_export = TodoExport { todos, lists: Some(lists) };
         let json = serde_json::to_string(&todo_export)
             .map_err(|e| format!("序列化 todo 失败: {e}"))?;
         let outcome = import_todo(db_path, &json)?;

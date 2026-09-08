@@ -27,9 +27,10 @@ pub mod db;
 pub mod models;
 // Ensure models.rs has correct Note/NoteResponse definitions (tags: Vec<String>)
 use crate::models::{
-    CreateCommentPayload, CreateNotePayload, CreateNoteRelationPayload, CreateTodoPayload,
-    DetailedTag, Note, NoteHistoryResponse, NoteRelation, NoteResponse, TagTreeResponse, Todo,
-    TodoResponse, UpdateNotePayload, UpdateTodoPayload, note_history_to_response,
+    CreateCommentPayload, CreateNotePayload, CreateNoteRelationPayload, CreateTodoListPayload,
+    CreateTodoPayload, DetailedTag, Note, NoteHistoryResponse, NoteRelation, NoteResponse,
+    TagTreeResponse, Todo, TodoListRecord, TodoListResponse, TodoResponse, UpdateNotePayload,
+    UpdateTodoListPayload, UpdateTodoPayload, note_history_to_response,
 };
 
 // --- Use correct DbConnection type ---
@@ -257,6 +258,10 @@ pub fn mount_rocket(rocket: Rocket<Build>, db: SharedDb, todo_db: SharedTodoDb) 
     info!("  - PUT    /inbox/todos/<id> (format=json)");
     info!("  - DELETE /inbox/todos/<id>");
     info!("  - PUT    /inbox/todos/<id>/restore");
+    info!("  - GET    /inbox/todo-lists");
+    info!("  - POST   /inbox/todo-lists (format=json)");
+    info!("  - PUT    /inbox/todo-lists/<id> (format=json)");
+    info!("  - DELETE /inbox/todo-lists/<id>");
 
     let rocket = rocket.mount(
         "/inbox",
@@ -285,6 +290,11 @@ pub fn mount_rocket(rocket: Rocket<Build>, db: SharedDb, todo_db: SharedTodoDb) 
             update_todo,
             delete_todo,
             restore_todo,
+            // Todo 清单路由
+            get_todo_lists,
+            create_todo_list,
+            update_todo_list,
+            delete_todo_list,
             // 调试路由
             inbox_route_debug,
         ],
@@ -487,6 +497,8 @@ fn todo_to_response(todo: &Todo) -> TodoResponse {
         priority: todo.priority,
         due_date: todo.due_date.map(|dt| dt.to_rfc3339()),
         tags: todo.tags.clone(),
+        subtasks: todo.subtasks.clone(),
+        list_id: todo.list_id,
         created_at: todo.created_at.to_rfc3339(),
         updated_at: todo.updated_at.to_rfc3339(),
         completed_at: todo.completed_at.map(|dt| dt.to_rfc3339()),
@@ -604,5 +616,85 @@ async fn restore_todo(
     match todo {
         Some(t) => Ok(Json(todo_to_response(&t))),
         None => Err(Status::NotFound),
+    }
+}
+
+// ── Todo list handlers（清单，与 tag 独立） ─────────────────────
+
+fn list_to_response(l: &TodoListRecord) -> TodoListResponse {
+    TodoListResponse {
+        id: l.id,
+        name: l.name.clone(),
+        color: l.color.clone(),
+        sort_order: l.sort_order,
+    }
+}
+
+#[get("/todo-lists")]
+async fn get_todo_lists(
+    db_state: &State<SharedTodoDb>,
+) -> Result<Json<Vec<TodoListResponse>>, Status> {
+    let db_arc = db_state.inner().0.clone();
+    let lists = task::spawn_blocking(move || {
+        let db = db_arc.lock().map_err(|_| Status::InternalServerError)?;
+        db::get_todo_lists_db(&db).map_err(handle_db_error)
+    })
+    .await
+    .map_err(handle_spawn_error)??;
+    Ok(Json(lists.iter().map(list_to_response).collect()))
+}
+
+#[post("/todo-lists", format = "json", data = "<payload>")]
+async fn create_todo_list(
+    db_state: &State<SharedTodoDb>,
+    payload: Json<CreateTodoListPayload>,
+) -> Result<Created<Json<TodoListResponse>>, Status> {
+    let db_arc = db_state.inner().0.clone();
+    let list = task::spawn_blocking(move || {
+        let mut db = db_arc.lock().map_err(|_| Status::InternalServerError)?;
+        db::create_todo_list_db(&mut db, payload.into_inner()).map_err(handle_db_error)
+    })
+    .await
+    .map_err(handle_spawn_error)??;
+    info!("Created todo list #{}: {}", list.id, list.name);
+    Ok(Created::new(format!("/inbox/todo-lists/{}", list.id)).body(Json(list_to_response(&list))))
+}
+
+#[put("/todo-lists/<list_id>", format = "json", data = "<payload>")]
+async fn update_todo_list(
+    db_state: &State<SharedTodoDb>,
+    list_id: i64,
+    payload: Json<UpdateTodoListPayload>,
+) -> Result<Json<TodoListResponse>, Status> {
+    let db_arc = db_state.inner().0.clone();
+    let list = task::spawn_blocking(move || {
+        let mut db = db_arc.lock().map_err(|_| Status::InternalServerError)?;
+        db::update_todo_list_db(&mut db, list_id, payload.into_inner()).map_err(handle_db_error)
+    })
+    .await
+    .map_err(handle_spawn_error)??;
+    match list {
+        Some(l) => Ok(Json(list_to_response(&l))),
+        None => Err(Status::NotFound),
+    }
+}
+
+#[delete("/todo-lists/<list_id>")]
+async fn delete_todo_list(
+    db_state: &State<SharedTodoDb>,
+    list_id: i64,
+) -> Result<Status, Status> {
+    let db_arc = db_state.inner().0.clone();
+    let deleted = task::spawn_blocking(move || {
+        let mut db = db_arc.lock().map_err(|_| Status::InternalServerError)?;
+        db::delete_todo_list_db(&mut db, list_id).map_err(handle_db_error)
+    })
+    .await
+    .map_err(handle_spawn_error)??;
+    if deleted {
+        info!("Deleted todo list #{}", list_id);
+        Ok(Status::NoContent)
+    } else {
+        Err(Status::NotFound)
     }
 }
