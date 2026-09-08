@@ -155,6 +155,9 @@ async fn config_save(state: &State<SharedManager>, cfg: Json<crate::models::Sync
             "[config] 同步设置已更新: enabled={}, discovery_method={}, listen_port={}, udp_port={}",
             cfg.enabled, cfg.discovery_method, cfg.listen_port, cfg.udp_port
         ));
+        // 关键：udp_port/discovery_method 等参数变化后，需要重建发现线程。
+        // DISCOVERY_THREADS_STARTED 是进程级 static，必须 reset 才能用新参数 spawn。
+        crate::manager::reset_discovery_started_for_testing();
         // 若此刻开启了同步，立即启动在线探测后台线程（无需重启服务）。
         // 注意：不再自动启动发现广播——广播只由「进入局域网同步界面」驱动（discovery/start），
         // 否则 Android 端 Wi-Fi 自动开启 enabled 时会在后台偷偷广播。
