@@ -304,7 +304,10 @@ impl SyncManager {
         }
 
         if result.archived > 0 {
-            let _ = self.add_log(&SyncLogEntry {
+            // 修复自死锁：此处 db 锁（MutexGuard）仍被本函数持有，
+            // 不能经 self.add_log() 再次 lock 同一个不可重入的 std::sync::Mutex，
+            // 必须直接用已持有的 guard 调用 SyncDb::add_log。
+            let _ = db.add_log(&SyncLogEntry {
                 id: None,
                 timestamp: Utc::now(),
                 direction: SyncDirection::In,
