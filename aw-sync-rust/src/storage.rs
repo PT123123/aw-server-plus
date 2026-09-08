@@ -148,14 +148,16 @@ impl SyncDb {
     }
 
     /// 广播发现 / 推送自动登记：不存在则插入（未配对状态），
-    /// 已存在则只刷新可达信息，**保留 paired / alias / last_sync_at / paired_at / last_seen_at**。
+    /// 已存在则刷新可达信息：更新 last_seen_at 并标记 is_online=1，
+    /// 保留 paired / alias / last_sync_at / paired_at。
     pub fn upsert_discovered(&self, d: &Device) -> Result<()> {
         let last_seen = d.last_seen_at.map(|dt| dt.to_rfc3339());
         self.conn.execute(
             "INSERT INTO devices (id,name,device_kind,ip,port,paired_at,last_sync_at,last_seen_at,is_online,is_self,paired,alias)
              VALUES (?1,?2,?3,?4,?5,?6,NULL,?7,0,0,0,NULL)
              ON CONFLICT(id) DO UPDATE SET name=excluded.name, device_kind=excluded.device_kind,
-               ip=excluded.ip, port=excluded.port, last_seen_at=excluded.last_seen_at, is_self=0",
+               ip=excluded.ip, port=excluded.port, last_seen_at=excluded.last_seen_at,
+               is_online=1, is_self=0",
             params![
                 d.id, d.name, d.device_kind.as_str(), d.ip, d.port as i64,
                 d.paired_at.to_rfc3339(), last_seen,
@@ -186,6 +188,18 @@ impl SyncDb {
     }
 
     pub fn touch_online(&self, id: &str, online: bool) -> Result<()> {
+        // 关键：如果设备最近被 UDP 广播发现过（30 秒内），不要覆盖 is_online=1。
+        // 否则 probe_loop 的 HTTP 探活失败会反复把在线设备标记为离线。
+        if !online {
+            let recently_seen: bool = self.conn.query_row(
+                "SELECT 1 FROM devices WHERE id=?1 AND last_seen_at > datetime('now', '-30 seconds')",
+                params![id],
+                |_| Ok(true),
+            ).unwrap_or(false);
+            if recently_seen {
+                return Ok(());
+            }
+        }
         self.conn.execute(
             "UPDATE devices SET is_online=?2 WHERE id=?1",
             params![id, online as i64],
