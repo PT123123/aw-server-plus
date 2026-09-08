@@ -899,8 +899,9 @@ impl SyncManager {
 
         }
 
-        let udp = cfg.udp_port;
-
+        // udp_port=0（配置未填写/旧版客户端写入）时回退默认端口，
+        // 否则监听会绑到临时端口、广播会发往 0 号端口，发现功能整体失效。
+        let udp = if cfg.udp_port == 0 { discovery::DEFAULT_UDP_PORT } else { cfg.udp_port };
         let self_device = self.self_device_info();
 
 
