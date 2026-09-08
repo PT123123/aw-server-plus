@@ -699,10 +699,12 @@ impl SyncManager {
             .spawn(move || {
                 let mut prev_enabled = false;
                 loop {
+                    // enabled=false 或 sync_interval=0（仅手动）时都不做自动轮询；
+                    // 手动同步与事件触发推送仍可调用 sync_to
                     let (enabled, interval_secs) = match SyncDb::open(&data_dir) {
                         Ok(db) => {
                             let cfg = db.get_config();
-                            (cfg.enabled, cfg.sync_interval.max(5))
+                            (cfg.enabled && cfg.sync_interval > 0, cfg.sync_interval.max(5))
                         }
                         Err(_) => (false, 10u64),
                     };
