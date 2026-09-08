@@ -120,8 +120,12 @@ pub struct Device {
     pub ip: String,
     /// 五位数同步 HTTP 端口（默认 56001）
     pub port: u16,
+    /// 配对时间。serde 默认值保证旧版客户端的广播报文（缺该字段）也能解析，
+    /// 否则模型新增必填字段后，新监听器会静默丢弃旧端广播，双端互相发现失败。
+    #[serde(default = "chrono::Utc::now")]
     pub paired_at: DateTime<Utc>,
     /// 最近一次成功同步时间
+    #[serde(default)]
     pub last_sync_at: Option<DateTime<Utc>>,
     /// 最近一次被发现/探测到的时间（用于判断在线状态）
     #[serde(default)]
