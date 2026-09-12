@@ -202,19 +202,26 @@ pub fn listener_loop(db: SharedDb, udp_port: u16, self_id: String) {
             return;
         }
     };
-    let socket = match UdpSocket::bind(addr) {
-        Ok(s) => s,
-        Err(e) => {
-            // 端口被其它进程占用属常见情况，仅警告不崩溃
-            crate::dbglog::warn(format!("[discovery] 监听 UDP 端口 {udp_port} 失败: {e}"));
-            return;
+    // 绑定失败不再直接退出线程：端口可能被同一进程里早先残留的套接字或另一个实例
+    // 短暂占用。线程一旦退出，本进程的「发现」就永久哑掉（广播发得出去、却再也收不到
+    // 任何设备），而且表面毫无异常 —— 只能靠 5 秒一次的重试把它救回来。
+    let socket = loop {
+        match UdpSocket::bind(addr) {
+            Ok(s) => break s,
+            Err(e) => {
+                crate::dbglog::warn(format!(
+                    "[discovery] 监听 UDP 端口 {udp_port} 失败: {e}，5 秒后重试"
+                ));
+                thread::sleep(Duration::from_secs(5));
+            }
         }
     };
     let mut buf = [0u8; 4096];
     // 读取超时：让循环能周期检查 discovery_active 开关
     let _ = socket.set_read_timeout(Some(Duration::from_secs(2)));
     loop {
-        // 未进入局域网同步界面：不处理广播（内核接收缓冲满后自动丢弃新包）
+        // 发现未开启（Android 端离开同步界面、或同步总开关关闭）：不处理广播
+        // （内核接收缓冲满后自动丢弃新包）。桌面端发现常驻，这里长期为 true。
         if !crate::manager::discovery_active() {
             thread::sleep(Duration::from_millis(500));
             continue;

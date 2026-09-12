@@ -155,13 +155,23 @@ async fn config_save(state: &State<SharedManager>, cfg: Json<crate::models::Sync
             "[config] 同步设置已更新: enabled={}, discovery_method={}, listen_port={}, udp_port={}",
             cfg.enabled, cfg.discovery_method, cfg.listen_port, cfg.udp_port
         ));
-        // 关键：udp_port/discovery_method 等参数变化后，需要重建发现线程。
-        // DISCOVERY_THREADS_STARTED 是进程级 static，必须 reset 才能用新参数 spawn。
-        crate::manager::reset_discovery_started_for_testing();
         // 若此刻开启了同步，立即启动在线探测后台线程（无需重启服务）。
-        // 注意：不再自动启动发现广播——广播只由「进入局域网同步界面」驱动（discovery/start），
-        // 否则 Android 端 Wi-Fi 自动开启 enabled 时会在后台偷偷广播。
         m.spawn_probe();
+        // 注意：这里曾经调用 reset_discovery_started_for_testing() 来「重建发现线程」，
+        // 但那会让下一次 discovery/start 在同一进程里再 spawn 一个 listener 去抢同一个
+        // UDP 端口，bind 必然 10048 失败 → 该进程的发现监听彻底哑掉（只发得出去、
+        // 收不到任何设备）。现在发现线程只拉起一次并常驻，udp_port 变更需重启进程生效。
+        //
+        // 是否恢复广播：
+        // - 桌面端：发现常驻（discovery_persistent），配置开启即回到广播状态；
+        // - Android 端：仍只由「进入局域网同步界面」驱动（discovery/start），
+        //   否则 Wi-Fi 自动开启 enabled 时会在后台偷偷广播。
+        if crate::manager::discovery_persistent()
+            && cfg.enabled
+            && cfg.discovery_method == "broadcast"
+        {
+            m.start_discovery();
+        }
         Ok(serde_json::to_value(m.get_config()).unwrap_or(serde_json::Value::Null))
     })
     .await
@@ -818,6 +828,13 @@ async fn status(state: &State<SharedManager>) -> Res {
     .await
 }
 
+/// 数据修订号：客户端低频轮询，值变了说明本地业务库被远端改动过 → 静默刷新列表。
+/// 比轮询 sync_log 可靠：无变更的自动同步轮刻意不写日志，日志出现断档并不代表没在同步。
+#[get("/revision")]
+async fn revision() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "revision": crate::manager::data_revision() }))
+}
+
 #[derive(FromForm)]
 struct DebugLogQuery {
     after: Option<u64>,
@@ -847,7 +864,7 @@ pub fn mount_rocket(rocket: Rocket<Build>, mgr: SharedManager) -> Rocket<Build> 
                 devices, add_device,
                 sync_now, device_delete, device_alias, devices_clear_all,
                 device_stats, device_conflicts,
-                logs, log_clear, push, apply, snapshot, debug_log, status,
+                logs, log_clear, push, apply, snapshot, debug_log, status, revision,
                 trash_list, trash_restore, trash_delete, trash_clear_all,
                 d1_test, d1_status, d1_sync_now, d1_full_sync, d1_reset, d1_logs
             ],

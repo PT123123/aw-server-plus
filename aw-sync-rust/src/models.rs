@@ -6,6 +6,15 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// 局域网同步 HTTP 端点的默认端口（= aw-server 的监听端口）。
+///
+/// 「配置值为 0」等价于「未配置」（旧版客户端会写入空值）。读取配置时必须
+/// 回退到这里：`self_device_info()` 直接拿 `cfg.listen_port` 拼自身端点，
+/// 0 会让广播/配对传出去的地址变成 `http://<ip>:0/...`，
+/// 对端拿到的就是坏端点 —— 反向同步（对端 → 本机）会彻底不通，
+/// 表现为「只有本机能拉到对端，对端永远推不过来」。
+pub const DEFAULT_HTTP_PORT: u16 = 5600;
+
 /// 设备类型
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
