@@ -357,11 +357,16 @@ impl SyncDb {
             if let Some(v) = map.get("discovery_method") {
                 cfg.discovery_method = v.as_str().unwrap_or("broadcast").to_string();
             }
+            // 端口 0 视为「未配置」（旧版客户端写入的空值），回退默认端口。
+            // 必须在这里兜底而不是只在使用处判断：self_device_info() 会把
+            // listen_port 当作本机对外端点端口广播出去，0 会让对端拿到坏地址。
             if let Some(v) = map.get("listen_port") {
-                cfg.listen_port = v.as_u64().unwrap_or(5600) as u16;
+                let p = v.as_u64().unwrap_or(0) as u16;
+                cfg.listen_port = if p == 0 { crate::models::DEFAULT_HTTP_PORT } else { p };
             }
             if let Some(v) = map.get("udp_port") {
-                cfg.udp_port = v.as_u64().unwrap_or(46000) as u16;
+                let p = v.as_u64().unwrap_or(0) as u16;
+                cfg.udp_port = if p == 0 { crate::discovery::DEFAULT_UDP_PORT } else { p };
             }
             if let Some(v) = map.get("sync_inbox") {
                 cfg.sync_inbox = v.as_bool().unwrap_or(true);

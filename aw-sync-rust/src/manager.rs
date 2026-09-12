@@ -327,6 +327,10 @@ impl SyncManager {
             "[sync] 快照应用完成: 来源 {}, applied={} archived={} errors={}",
             src, result.applied, result.archived, result.errors.len()
         ));
+        // 只有真的改动了本地业务库才递增修订号（无变更的自动轮不打扰客户端）
+        if result.applied > 0 || result.archived > 0 {
+            bump_data_revision();
+        }
         Ok(result)
     }
 
@@ -679,6 +683,11 @@ impl SyncManager {
     /// 与 spawn_d1_sync 同模式：进程内只启动一次、常驻循环、每轮重读配置。
     /// 因需调用 sync_to（&self 方法），此处以 SharedManager 为参而非 &self。
     /// 三档模式即 sync_interval 的预设：狂暴 10 / 平和 300 / 静默 1800（秒）。
+    ///
+    /// 除周期轮询外还有两个「不等下一轮」的触发点：
+    /// - 同步开关 false→true：立即全量尝试一轮（不管在线标志）；
+    /// - 设备在线标志 0→1（对端刚回到局域网）：立即同步该设备。
+    /// 另外离线设备每 OFFLINE_RETRY_SECS 补探一次，避免 is_online 卡在 0 时被永久静默跳过。
     pub fn spawn_auto_sync(mgr: &SharedManager) -> std::thread::JoinHandle<()> {
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -698,6 +707,13 @@ impl SyncManager {
             .name("aw-sync-auto".into())
             .spawn(move || {
                 let mut prev_enabled = false;
+                // 上一轮各设备的在线状态（id → is_online），用于识别「刚回到局域网」
+                let mut prev_online: HashMap<String, bool> = HashMap::new();
+                // 离线设备的最近一次补探时刻：即使探测线程失灵，自动同步也能自己把设备探回来
+                let mut offline_probe_at: HashMap<String, std::time::Instant> = HashMap::new();
+                // 离线设备补探间隔（秒）
+                const OFFLINE_RETRY_SECS: u64 = 30;
+
                 loop {
                     // enabled=false 或 sync_interval=0（仅手动）时都不做自动轮询；
                     // 手动同步与事件触发推送仍可调用 sync_to
@@ -718,14 +734,43 @@ impl SyncManager {
                             );
                         }
                         if let Ok(db) = SyncDb::open(&data_dir) {
-                            let targets: Vec<crate::models::Device> = match db.get_devices() {
-                                Ok(devices) => devices
-                                    .into_iter()
-                                    .filter(|d| d.paired && !d.is_self && (force || d.is_online))
-                                    .collect(),
-                                Err(_) => Vec::new(),
-                            };
-                            for d in targets {
+                            let devices = db.get_devices().unwrap_or_default();
+                            for d in devices {
+                                if !d.paired || d.is_self {
+                                    continue;
+                                }
+
+                                // 在线状态翻转（0→1）：对端刚回到局域网，不等下一轮，立刻同步。
+                                // 这是「手机连上 Wi-Fi 就该自动传」的关键触发点。
+                                let was_online =
+                                    prev_online.insert(d.id.clone(), d.is_online).unwrap_or(false);
+                                if d.is_online && !was_online {
+                                    crate::dbglog::info(format!(
+                                        "[auto] 设备 {}({}) 已回到局域网，立即同步一轮",
+                                        d.name, d.id
+                                    ));
+                                } else if was_online && !d.is_online {
+                                    crate::dbglog::info(format!(
+                                        "[auto] 设备 {}({}) 已离线，暂停自动同步",
+                                        d.name, d.id
+                                    ));
+                                }
+
+                                // 离线设备按 OFFLINE_RETRY_SECS 补探一次：
+                                // 只信 is_online 会形成死结 —— 一旦该标志没能被刷回 1，
+                                // 这里就每轮静默跳过（连日志都没有），用户只能手动点同步。
+                                if !d.is_online {
+                                    let due = offline_probe_at
+                                        .get(&d.id)
+                                        .map_or(true, |t| t.elapsed().as_secs() >= OFFLINE_RETRY_SECS);
+                                    if !due && !force {
+                                        continue;
+                                    }
+                                    offline_probe_at.insert(d.id.clone(), std::time::Instant::now());
+                                } else {
+                                    offline_probe_at.remove(&d.id);
+                                }
+
                                 // 先做轻量可达性探测（不持锁，连接 2s/读取 3s）：对端离网时
                                 // 快速跳过，避免拿住全局锁等满 HTTP 总超时、饿死其余接口
                                 if crate::transport::probe_online(&d).is_err() {
@@ -735,6 +780,15 @@ impl SyncManager {
                                     ));
                                     continue;
                                 }
+                                if !d.is_online {
+                                    // 补探成功：设备实际可达但标志位还是 0，说明探测线程没跟上，
+                                    // 这里直接按「刚回到局域网」处理，立即补一轮
+                                    crate::dbglog::info(format!(
+                                        "[auto] 设备 {}({}) 恢复可达，立即补一轮同步",
+                                        d.name, d.id
+                                    ));
+                                }
+
                                 // 分阶段加锁同步：网络传输不持锁，UI 请求只与短小的本地阶段竞争
                                 if let Err(e) = SyncManager::sync_to_unlocked(&mgr, &d.id, false) {
                                     crate::dbglog::warn(format!(
@@ -879,11 +933,15 @@ impl SyncManager {
 
 
     /// 离开「局域网同步」界面：停止广播与监听处理（不进入界面绝不广播）。
-
+    ///
+    /// 桌面端为 no-op：桌面端发现常驻（见 `discovery_persistent`），
+    /// 否则离开页面就等于关掉设备发现 —— 对端换 IP / 换设备 id / 上下线全部失明，
+    /// 只剩 HTTP 探活，正是「手机回到局域网却不自动同步」的根因之一。
     pub fn stop_discovery(&self) {
-
+        if discovery_persistent() {
+            return;
+        }
         set_discovery_active(false);
-
     }
 
 
@@ -1616,6 +1674,43 @@ pub fn reset_discovery_started_for_testing() {
 
 }
 
+
+/// 发现广播是否「常驻」。
+///
+/// 桌面端（Windows/Linux/macOS）常驻：设备发现是「手机一回到局域网就自动同步」的前提，
+/// 桌面端也不缺那点电 —— 把广播绑在 UI 页面上意味着页面外永远发现不到对端
+/// （换 IP / 换 device id / 上下线全都感知不到，只剩 HTTP 探活硬猜）。
+///
+/// Android 端保持「进入局域网同步界面才广播」的省电语义不变。
+#[cfg(target_os = "android")]
+pub const fn discovery_persistent() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "android"))]
+pub const fn discovery_persistent() -> bool {
+    true
+}
+
+// ---- 数据修订号（远端变更 → 客户端刷新界面的信号） ----
+
+/// 数据修订号：每当远端数据真正落地（快照合并有新应用或新归档）就 +1。
+///
+/// 客户端无法从「同步完成」推断界面该不该刷新（无变更的自动轮询刻意不写日志），
+/// 所以单独暴露一个单调递增的计数：客户端低频轮询 `GET /api/0/sync/revision`，
+/// 值变了说明本地业务库被远端改动过 → 静默刷新列表。
+/// 进程内计数即可：客户端轮询的就是同一个进程。
+static DATA_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 当前数据修订号（供 /api/0/sync/revision 查询）
+pub fn data_revision() -> u64 {
+    DATA_REVISION.load(Ordering::SeqCst)
+}
+
+/// 远端数据落地后递增修订号（apply_snapshot 内调用）
+fn bump_data_revision() {
+    DATA_REVISION.fetch_add(1, Ordering::SeqCst);
+}
 
 // ---- 合并结果落库：写回收站 + sync_conflicts ----
 
