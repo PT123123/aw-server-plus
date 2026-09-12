@@ -714,6 +714,16 @@ impl SyncManager {
                 // 离线设备补探间隔（秒）
                 const OFFLINE_RETRY_SECS: u64 = 30;
 
+                // 探测失败后的后台重发现窗口与等待时长（等对端广播刷新记录里的 IP）
+                const REDISCOVER_WINDOW_SECS: u64 = 6;
+                const REDISCOVER_WAIT_MS: u64 = 3000;
+                // 重发现限流：对端只是关机/离网时探测失败也会走到自愈分支，若每轮都开
+                // 广播窗口，在狂暴档（间隔 10s）下几乎全程都在发 UDP —— 白耗电还招系统清理。
+                // 离线设备本身已有 OFFLINE_RETRY_SECS 的补探门限，两者取同一量级即可。
+                const REDISCOVER_MIN_INTERVAL_SECS: u64 = 30;
+                // 最近一次开重发现窗口的时刻（全局限流用）
+                let mut last_rediscover: Option<std::time::Instant> = None;
+
                 loop {
                     // enabled=false 或 sync_interval=0（仅手动）时都不做自动轮询；
                     // 手动同步与事件触发推送仍可调用 sync_to
@@ -774,11 +784,46 @@ impl SyncManager {
                                 // 先做轻量可达性探测（不持锁，连接 2s/读取 3s）：对端离网时
                                 // 快速跳过，避免拿住全局锁等满 HTTP 总超时、饿死其余接口
                                 if crate::transport::probe_online(&d).is_err() {
-                                    crate::dbglog::info(format!(
-                                        "[auto] 设备 {}({}) 不可达，本轮跳过同步",
-                                        d.name, d.id
+                                    // 探测失败不再直接放弃：记录里的 IP 可能已经过期（对端 DHCP
+                                    // 换了地址），这时再怎么重试旧地址都是白搭。开一个短暂的后台
+                                    // 重发现窗口，让对端广播把 IP 刷成当前真实地址后重试一次。
+                                    // 刚开启的那一轮必开窗口（最需要自愈的时刻），其余按限流走。
+                                    let may_rediscover = force
+                                        || last_rediscover.map_or(true, |t| {
+                                            t.elapsed().as_secs()
+                                                >= REDISCOVER_MIN_INTERVAL_SECS
+                                        });
+                                    if !may_rediscover {
+                                        crate::dbglog::info(format!(
+                                            "[auto] 设备 {}({}) 不可达，本轮跳过同步（距上次重发现不足 {REDISCOVER_MIN_INTERVAL_SECS}s，未重复开广播）",
+                                            d.name, d.id
+                                        ));
+                                        continue;
+                                    }
+                                    last_rediscover = Some(std::time::Instant::now());
+                                    if let Ok(g) = mgr.lock() {
+                                        g.start_discovery_burst(REDISCOVER_WINDOW_SECS);
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(
+                                        REDISCOVER_WAIT_MS,
                                     ));
-                                    continue;
+                                    // 重读该设备：广播可能刚把 ip/port 刷新过
+                                    let refreshed = SyncDb::open(&data_dir)
+                                        .ok()
+                                        .and_then(|db| db.get_devices().ok())
+                                        .and_then(|vs| vs.into_iter().find(|x| x.id == d.id))
+                                        .unwrap_or_else(|| d.clone());
+                                    if crate::transport::probe_online(&refreshed).is_err() {
+                                        crate::dbglog::info(format!(
+                                            "[auto] 设备 {}({}) 不可达，本轮跳过同步（已尝试后台重发现）",
+                                            d.name, d.id
+                                        ));
+                                        continue;
+                                    }
+                                    crate::dbglog::info(format!(
+                                        "[auto] 设备 {}({}) 后台重发现后恢复可达 {}:{}，继续同步",
+                                        d.name, d.id, refreshed.ip, refreshed.port
+                                    ));
                                 }
                                 if !d.is_online {
                                     // 补探成功：设备实际可达但标志位还是 0，说明探测线程没跟上，
@@ -942,6 +987,28 @@ impl SyncManager {
             return;
         }
         set_discovery_active(false);
+    }
+
+
+
+    /// 后台自愈发现窗口：不依赖是否停留在同步界面，短暂开一轮 UDP 广播+监听，
+    /// 让对端广播把设备记录里的 IP 刷新成当前真实地址。用在两处：
+    /// ① Android 侧检测到 Wi-Fi / 本机 IP 变化后主动调一次；
+    /// ② spawn_auto_sync 探测失败时自己开一次，重读记录再试一遍。
+    pub fn start_discovery_burst(&self, secs: u64) {
+        let secs = secs.clamp(1, 30);
+        // 线程进程内常驻（只拉起一次），这里只保证已拉起
+        self.ensure_discovery_threads();
+        let until = now_ms() + secs.saturating_mul(1000);
+        DISCOVERY_BURST_UNTIL_MS.store(until, Ordering::SeqCst);
+        crate::dbglog::info(format!(
+            "[discovery] 开启后台重发现窗口 {secs}s（用于刷新对端 IP）"
+        ));
+    }
+
+    /// 立刻结束后台自愈窗口（不影响由界面驱动的常开发现）
+    pub fn stop_discovery_burst(&self) {
+        DISCOVERY_BURST_UNTIL_MS.store(0, Ordering::SeqCst);
     }
 
 
@@ -1628,6 +1695,19 @@ static DISCOVERY_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 
 
+/// 后台自愈发现窗口的截止时刻（Unix 毫秒），0 = 未开启。
+///
+/// 与「是否停留在同步界面」解耦：探测失败时短暂开一轮广播+监听，让对端广播把
+/// 设备记录里的 IP 刷成当前真实地址，解决「对端换了 IP（DHCP 重分配）之后本机
+/// 永远按旧地址探测失败」——只靠 HTTP 探活是猜不出来的。
+///
+/// Android 端尤其需要：那边 discovery_persistent() 为 false，离开同步界面就没有
+/// 任何广播/监听，后台期间对端换地址后自动同步会一直静默失败。
+
+static DISCOVERY_BURST_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+
+
 /// 发现线程是否已拉起（进程内只 spawn 一次，之后由 DISCOVERY_ACTIVE 控制实际收发）
 
 static DISCOVERY_THREADS_STARTED: AtomicBool = AtomicBool::new(false);
@@ -1644,11 +1724,38 @@ pub fn discovery_running() -> bool {
 
 
 
-/// 发现循环每轮检查的开关（discovery.rs 调用）：未开启时广播/监听空转
+/// 发现循环每轮检查的开关（discovery.rs 调用）：未开启时广播/监听空转。
+/// 两个来源：① discovery/start 打开的常开标志；② 后台自愈窗口（burst）。
 
 pub(crate) fn discovery_active() -> bool {
 
-    DISCOVERY_ACTIVE.load(Ordering::SeqCst)
+    DISCOVERY_ACTIVE.load(Ordering::SeqCst) || discovery_burst_pending()
+
+}
+
+
+
+/// 后台自愈窗口是否仍未过期
+
+pub(crate) fn discovery_burst_pending() -> bool {
+
+    let until = DISCOVERY_BURST_UNTIL_MS.load(Ordering::SeqCst);
+
+    until != 0 && now_ms() < until
+
+}
+
+
+
+fn now_ms() -> u64 {
+
+    std::time::SystemTime::now()
+
+        .duration_since(std::time::UNIX_EPOCH)
+
+        .map(|d| d.as_millis() as u64)
+
+        .unwrap_or(0)
 
 }
 
@@ -1657,6 +1764,10 @@ pub(crate) fn discovery_active() -> bool {
 pub(crate) fn set_discovery_active(v: bool) {
 
     DISCOVERY_ACTIVE.store(v, Ordering::SeqCst);
+
+    // 注意：这里刻意不清 burst。Android 端离开同步界面会调 stop_discovery()，
+    // 若顺带清掉自愈窗口，就会把后台刚开的那一轮重发现掐死；而 burst 自带截止
+    // 时刻（最长 30s），不清理也不会泄漏。
 
 }
 
