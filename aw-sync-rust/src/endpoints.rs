@@ -203,6 +203,26 @@ async fn discovery_stop(state: &State<SharedManager>) -> Res {
     .await
 }
 
+/// 后台自愈重发现窗口（秒）：不依赖「是否停留在同步界面」，短暂开一轮 UDP 广播+监听，
+/// 让对端广播把设备记录里的 IP 刷新成当前真实地址。secs=0 表示立刻关闭。
+///
+/// 调用方：① Android 侧回到 Wi-Fi / 本机 IP 变化后；② auto_sync 探测失败后自己开。
+#[post("/discovery/burst?<secs>")]
+async fn discovery_burst(state: &State<SharedManager>, secs: Option<u64>) -> Res {
+    run(state, move |m| {
+        let secs = secs.unwrap_or(5);
+        if secs == 0 {
+            m.stop_discovery_burst();
+            Ok(serde_json::json!({ "burst_secs": 0 }))
+        } else {
+            let secs = secs.clamp(1, 30);
+            m.start_discovery_burst(secs);
+            Ok(serde_json::json!({ "burst_secs": secs }))
+        }
+    })
+    .await
+}
+
 // ---- 配对 ----
 
 #[post("/paircode")]
@@ -858,7 +878,7 @@ pub fn mount_rocket(rocket: Rocket<Build>, mgr: SharedManager) -> Rocket<Build> 
         .mount(
             "/api/0/sync",
             routes![
-                root, info, config, config_save, discovery_start, discovery_stop,
+                root, info, config, config_save, discovery_start, discovery_stop, discovery_burst,
                 create_paircode, join,
                 pair_initiate, pair_accept, pair_request, pair_confirm,
                 devices, add_device,

@@ -95,7 +95,17 @@ for archtargetstr in \
     export RUSTUP_DIST_SERVER=https://rsproxy.cn
     export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
     export CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
-    export PATH="$NDK_ARCH_DIR:$ORIG_PATH"
+    # MSYS/Git Bash 的 PATH 查找不认 "C:/..." 形式（command -v 会报找不到），
+    # 需转成 /c/... 形式再加进 PATH。其余变量（AR/CC/LINKER/RUSTFLAGS）仍用
+    # C:/... 形式，直接喂给 Windows 程序。
+    case "$NDK_ARCH_DIR" in
+        [A-Za-z]:/*)
+            _drive="$(printf '%s' "${NDK_ARCH_DIR:0:1}" | tr 'A-Z' 'a-z')"
+            _ndk_path_dir="/$_drive${NDK_ARCH_DIR:2}"
+            ;;
+        *) _ndk_path_dir="$NDK_ARCH_DIR" ;;
+    esac
+    export PATH="$_ndk_path_dir:$ORIG_PATH"
     export RUSTFLAGS="$ORIG_RUSTFLAGS"
     # Need to set AR for target since NDK 21+:
     #   https://github.com/rust-lang/cc-rs/issues/636#issuecomment-1075352495

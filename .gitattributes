@@ -1,0 +1,6 @@
+# 仓库里的 .sh 全部是 LF（blob 里 0 个 CR）。而本机 core.autocrlf=true，
+# 没有这条锁的话 checkout 会把它们变成 CRLF —— 表现是
+# `set -euo pipefail\r` 报 "invalid option name"，整条构建命令直接挂，
+# 且在编译期完全看不出来（Windows 上反复踩过）。
+*.sh text eol=lf
+.gitattributes text eol=lf
