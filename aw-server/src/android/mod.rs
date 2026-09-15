@@ -768,6 +768,16 @@ pub mod android {
                 return create_error_object(&env, err.to_string());
             }
         };
+        // 与 HTTP 端点(bucket_new)保持一致：hostname 为 "!local" 时展开为本机名并写入 device_id
+        let mut bucket_json = bucket_json;
+        if bucket_json.hostname == "!local" {
+            bucket_json.hostname = gethostname::gethostname()
+                .into_string()
+                .unwrap_or_else(|_| "unknown".to_string());
+            bucket_json
+                .data
+                .insert("device_id".to_string(), device_id::get_device_id().into());
+        }
         debug!("开始在数据存储中创建存储桶...");
         match openDatastore().create_bucket(&bucket_json) {
             Ok(()) => {
