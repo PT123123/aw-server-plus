@@ -30,8 +30,9 @@ fn _get_db_version(conn: &Connection) -> i32 {
  * 3: see: https://github.com/ActivityWatch/aw-server-rust/pull/52
  * 4: Added 'key_value' table for storing key - value pairs
  * 5: Replaced single-column events indexes with a composite index
+ * 6: Rewrote 'Unknown (pkg)' app names in event data to their real package names
  */
-static NEWEST_DB_VERSION: i32 = 5;
+static NEWEST_DB_VERSION: i32 = 6;
 
 fn _create_tables(conn: &Connection, version: i32) -> bool {
     let mut first_init = false;
@@ -55,6 +56,10 @@ fn _create_tables(conn: &Connection, version: i32) -> bool {
 
     if version < 5 {
         _migrate_v4_to_v5(conn);
+    }
+
+    if version < 6 {
+        _migrate_v5_to_v6(conn);
     }
 
     first_init
@@ -205,6 +210,63 @@ fn _migrate_v4_to_v5(conn: &Connection) {
     ",
     )
     .expect("Failed to run v5 migration transaction");
+}
+
+fn _migrate_v5_to_v6(conn: &Connection) {
+    info!("Upgrading database to v6, rewriting 'Unknown (pkg)' app names to real package names");
+    // 采集端曾在 PackageManager 解析失败时把 app 写成 "Unknown (包名)"，
+    // 但事件 data 里始终带有真实包名(package 字段)，这里把它回填到 app。
+    // LIKE 兼容紧凑与带空格两种 JSON 序列化格式，最终以解析后的精确判断为准。
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, data FROM events
+                 WHERE data LIKE '%\"app\":\"Unknown (%' OR data LIKE '%\"app\": \"Unknown (%'",
+            )
+            .expect("Failed to prepare Unknown-app scan query");
+        let mapped = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("Failed to query events for Unknown-app rewrite");
+        mapped.filter_map(|r| r.ok()).collect()
+    };
+    let mut updated = 0usize;
+    for (id, data) in rows {
+        let mut value: Value = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let obj = match value.as_object_mut() {
+            Some(o) => o,
+            None => continue,
+        };
+        let is_unknown = obj
+            .get("app")
+            .and_then(|v| v.as_str())
+            .map(|s| s.starts_with("Unknown (") && s.ends_with(')'))
+            .unwrap_or(false);
+        if !is_unknown {
+            continue;
+        }
+        let package = match obj.get("package").and_then(|v| v.as_str()) {
+            Some(p) if !p.is_empty() => p.to_string(),
+            _ => continue,
+        };
+        obj.insert("app".to_string(), Value::String(package));
+        let new_data = value.to_string();
+        if let Err(e) =
+            conn.execute("UPDATE events SET data = ?1 WHERE id = ?2", params![new_data, id])
+        {
+            warn!("Failed to rewrite app name of event {id}: {e}");
+            continue;
+        }
+        updated += 1;
+    }
+    info!("Unknown-app rewrite complete: {updated} events updated");
+
+    conn.pragma_update(None, "user_version", 6)
+        .expect("Failed to update database version!");
 }
 
 pub struct DatastoreInstance {
