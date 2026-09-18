@@ -22,3 +22,6 @@ platform-tools/
 
 # 自动生成的 fastlane 图标
 fastlane/metadata/android/en-US/images/icon.png
+
+# 由上层 aw-qtui 仓库 `just server` 在构建时同步进来的 exe 内嵌图标
+aw-server/windows/app.ico
