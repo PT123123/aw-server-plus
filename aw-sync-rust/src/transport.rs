@@ -62,6 +62,24 @@ pub fn confirm_pair(target: &Device, self_device: &Device) -> Result<serde_json:
     resp.json().map_err(|e| format!("解析确认配对响应失败: {e}"))
 }
 
+/// 用配对码加入对端：`POST http://<peer>/api/0/sync/join`，body = `{code, device}`。
+/// 与本机（发起方）无关的第三方拿不到这个码，所以它是「跨网段/未互相发现」时的兜底通道；
+/// 响应里对端会回传本次商定好的 device_secret。
+pub fn join_with_code(target: &Device, code: &str, self_device: &Device) -> Result<serde_json::Value, String> {
+    let url = format!("{}/join", target.endpoint());
+    crate::dbglog::info(format!("[pair] 用配对码向 {} 发起加入 ({url})", target.name));
+    let body = serde_json::json!({ "code": code, "device": self_device });
+    let resp = client()?
+        .post(&url)
+        .json(&body)
+        .send()
+        .map_err(|e| format!("加入请求发送失败: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("加入被拒: HTTP {}（配对码无效或已过期？）", resp.status()));
+    }
+    resp.json().map_err(|e| format!("解析加入响应失败: {e}"))
+}
+
 /// 在线探测：`GET http://<peer>/api/0/sync/info`。成功即对端在线，返回本机信息。
 /// 使用更短的超时（连接 2s + 读取 3s），并校验响应包含预期字段（device_id），防止误判。
 pub fn probe_online(target: &Device) -> Result<serde_json::Value, String> {
@@ -101,9 +119,29 @@ fn valid_probe_response(json: &serde_json::Value) -> bool {
 
 /// 把一个同步快照推送到对端（`POST http://<peer>:<port>/api/0/sync/push`）。
 /// `target` 为推送目标设备；`snapshot.source_device` 一般为本机（发送方）信息。
-pub fn push_snapshot(target: &crate::models::Device, snapshot: &SyncSnapshot) -> Result<usize, String> {
+///
+/// `secret` 为本机与该对端的共享密钥（配对时交换）：有则报文体走 AES-256-GCM 信封，
+/// 无（旧端/尚未交换）则退回明文快照 —— 两端版本不一致时同步不能直接哑掉。
+pub fn push_snapshot(
+    target: &Device,
+    snapshot: &SyncSnapshot,
+    secret: Option<&str>,
+) -> Result<usize, String> {
     let url = format!("{}/push", target.endpoint());
-    crate::dbglog::info(format!("[push] 开始推送到 {} ...", url));
+    let self_id = snapshot
+        .source_device
+        .as_ref()
+        .map(|d| d.id.clone())
+        .unwrap_or_default();
+    let plain = serde_json::to_string(snapshot).map_err(|e| format!("序列化快照失败: {e}"))?;
+    let body = crate::crypto::seal_body(secret, crate::crypto::PATH_PUSH, &self_id, &plain)?;
+    let encrypted = body != plain;
+    crate::dbglog::info(format!(
+        "[push] 开始推送到 {} ...（{}，明文 {}B）",
+        url,
+        if encrypted { "信封加密" } else { "明文·兼容旧端" },
+        plain.len()
+    ));
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(2))
         .timeout(std::time::Duration::from_secs(60))
@@ -111,7 +149,8 @@ pub fn push_snapshot(target: &crate::models::Device, snapshot: &SyncSnapshot) ->
         .map_err(|e| e.to_string())?;
     let resp = client
         .post(&url)
-        .json(snapshot)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
         .send()
         .map_err(|e| format!("发送同步请求到 {url} 失败: {e}"))?;
     if !resp.status().is_success() {
@@ -125,9 +164,11 @@ pub fn push_snapshot(target: &crate::models::Device, snapshot: &SyncSnapshot) ->
 }
 
 /// 从对端拉取快照（`GET http://<peer>:<port>/api/0/sync/snapshot`）。
-/// 对端返回 SyncSnapshot JSON（含 source_device 与各业务库载荷）。
-pub fn fetch_snapshot(target: &Device) -> Result<SyncSnapshot, String> {
-    let url = format!("{}/snapshot", target.endpoint());
+/// 对端可能返回明文 SyncSnapshot JSON，也可能返回信封（对端已与我们交换过密钥）：
+/// 两种都在这里收敛成 SyncSnapshot，调用方无感。
+pub fn fetch_snapshot(target: &Device, secret: Option<&str>, self_id: &str) -> Result<SyncSnapshot, String> {
+    // from=<本机 id>：让对端知道该用哪把密钥封装响应（它只有我们配对时才拿到过）
+    let url = format!("{}/snapshot?from={}", target.endpoint(), self_id);
     crate::dbglog::info(format!("[pull] 开始从 {} 拉取快照 ({url})", target.name));
     let resp = client()?
         .get(&url)
@@ -136,9 +177,10 @@ pub fn fetch_snapshot(target: &Device) -> Result<SyncSnapshot, String> {
     if !resp.status().is_success() {
         return Err(format!("拉取快照被拒: HTTP {} ({url})", resp.status()));
     }
-    let snap: SyncSnapshot = resp
-        .json()
-        .map_err(|e| format!("解析拉取快照响应失败: {e}"))?;
+    let raw = resp.text().map_err(|e| format!("读取快照响应失败: {e}"))?;
+    let plain = crate::crypto::open_body(secret, crate::crypto::PATH_SNAPSHOT, &raw)?;
+    let snap: SyncSnapshot =
+        serde_json::from_str(&plain).map_err(|e| format!("解析拉取快照响应失败: {e}"))?;
     crate::dbglog::info(format!(
         "[pull] 拉取完成: activity={}B inbox={}B todo={}B",
         snap.activity.as_ref().map_or(0, |s| s.len()),
@@ -180,6 +222,8 @@ mod tests {
             is_self: false,
             paired: false,
             alias: None,
+            device_secret: None,
+            machine_uid: None,
         }
         .endpoint();
         assert_eq!(url, "http://192.168.1.5:56001/api/0/sync");

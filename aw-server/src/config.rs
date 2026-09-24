@@ -83,9 +83,12 @@ impl AWConfig {
         };
 
         // Needed for bucket imports
+        // bytes：/api/0/sync/push 以原始字节接收报文体（可能是信封），
+        // 默认 8KiB 会把大快照直接 413 掉。
         let limits = Limits::default()
             .limit("json", 1000u64.megabytes())
-            .limit("data-form", 1000u64.megabytes());
+            .limit("data-form", 1000u64.megabytes())
+            .limit("bytes", 1000u64.megabytes());
 
         config.address = self.address.parse().unwrap();
         config.port = self.port;

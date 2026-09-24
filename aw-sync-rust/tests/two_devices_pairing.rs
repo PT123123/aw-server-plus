@@ -32,18 +32,68 @@ fn fake_device(id: &str, name: &str, ip: &str) -> Device {
         is_self: false,
         paired: false,
         alias: None,
+        device_secret: None,
+        machine_uid: None,
     }
 }
 
 #[test]
-fn paircode_is_four_digits() {
+fn paircode_is_six_digits() {
     let (_d, a) = make_manager(A_ID);
     let g = a.lock().unwrap();
     for _ in 0..50 {
         let pc = g.create_pair_code().unwrap();
-        assert_eq!(pc.code.len(), 4, "应为4位");
+        assert_eq!(pc.code.len(), 6, "应为 6 位（4 位太容易被同网段暴力试码）");
         assert!(pc.code.chars().all(|c| c.is_ascii_digit()), "应为纯数字: {}", pc.code);
     }
+}
+
+#[test]
+fn pair_secrets_are_stored_outside_the_device_list() {
+    let (_d, a) = make_manager(A_ID);
+    let g = a.lock().unwrap();
+    let secret = g.adopt_incoming_secret(B_ID, None).unwrap();
+    assert!(aw_sync_rust::crypto::secret_ok(&secret), "本机应自生成一把合法密钥");
+    assert_eq!(g.device_secret(B_ID).as_deref(), Some(secret.as_str()));
+
+    // 安全码：两端各算各的，必须相等（人工比对的前提）
+    let fp_a = g.security_fingerprints();
+    assert_eq!(fp_a.get(B_ID).map(String::as_str), aw_sync_rust::crypto::fingerprint(&secret, A_ID, B_ID).as_deref());
+
+    // 对端带着密钥来（发起方决定）→ 本机采纳而不是另生成
+    let offered = aw_sync_rust::crypto::generate_secret();
+    let got = g.adopt_incoming_secret(B_ID, Some(&offered)).unwrap();
+    assert_eq!(got, offered);
+    // 非法格式（长度/字符集）一律拒绝并改为自生成，绝不把脏值当密钥存下来
+    let got2 = g.adopt_incoming_secret(B_ID, Some("not-a-secret")).unwrap();
+    assert!(aw_sync_rust::crypto::secret_ok(&got2));
+    assert_ne!(got2, offered);
+
+    // 密钥绝不能出现在 /devices 序列化的 Device 里
+    let devs = g.list_devices().unwrap();
+    assert!(devs.iter().all(|d| d.device_secret.is_none()), "设备列表不得携带密钥");
+}
+
+#[test]
+fn unpairing_destroys_the_shared_secret() {
+    let (_d, a) = make_manager(A_ID);
+    {
+        let g = a.lock().unwrap();
+        g.save_device(&fake_device(B_ID, "b", "10.0.0.9")).unwrap();
+        g.adopt_incoming_secret(B_ID, None).unwrap();
+        assert!(g.device_secret(B_ID).is_some());
+    }
+    // 删除设备：密钥必须一起消失，否则重新配对会撞上旧钥
+    assert!(a.lock().unwrap().delete_device(B_ID).unwrap());
+    assert!(a.lock().unwrap().device_secret(B_ID).is_none(), "删除设备后密钥应级联清除");
+
+    {
+        let g = a.lock().unwrap();
+        g.save_device(&fake_device(B_ID, "b", "10.0.0.9")).unwrap();
+        g.adopt_incoming_secret(B_ID, None).unwrap();
+    }
+    assert!(a.lock().unwrap().clear_all_devices().unwrap() >= 1);
+    assert!(a.lock().unwrap().device_secret(B_ID).is_none(), "清空配对信息应级联清除密钥");
 }
 
 #[test]

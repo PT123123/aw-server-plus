@@ -2,6 +2,8 @@ target
 dist
 .cargo/config
 NDK
+# 宿主仓库（aw-qtui / aw-android）把 CARGO_TARGET_DIR 指到共享源码目录内时的私有缓存
+.cargo-target-server/
 
 **/*.rs.bk
 *.zip

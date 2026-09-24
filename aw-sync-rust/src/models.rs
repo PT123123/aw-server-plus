@@ -147,6 +147,26 @@ pub struct Device {
     /// 用户设置的别名（展示优先于 name）
     #[serde(default)]
     pub alias: Option<String>,
+    /// 配对时一次性交换的信封加密密钥（32 字节 hex，见 crypto 模块）。
+    ///
+    /// 只出现在配对握手的报文里：落库走独立的 device_secrets 表，`row_to_device`
+    /// 永远填 None，因此 /devices、/info 等同网段可读的接口不会把密钥带出去。
+    /// `default` 让旧端发来的报文（没有这个字段）照常解析，不会像当初 paired_at
+    /// 那样把老版本打挂；`skip_serializing_if` 让无关响应保持干净。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_secret: Option<String>,
+    /// 这台机器的「装机指纹」：由 OS 级稳定标识（Windows MachineGuid / Android
+    /// ANDROID_ID / Linux dbus machine-id）派生，见 `machine_uid` 模块。
+    ///
+    /// 用途只有一个：**重装或换 device id 后认出「还是那台机器」**，从而把换 id 前那条
+    /// 旧记录并进当前这条（旧 id 再也不会上线，留着只会是一行永远离线的幽灵）。它不是身份凭据（那些 OS 值任何本地应用都能读、能仿），
+    /// 所以它绝不参与密钥信任，只决定 UI 上要不要提示「疑似同一台机器」。
+    ///
+    /// 与 device_secret 同一条纪律：只出现在用户主动发起的配对握手报文里。
+    /// 广播 / mDNS TXT 一律抹掉（`discovery::announce_payload` 那处脱敏），否则局域网里
+    /// 任何人被动抓包就拿到一个跨网络可跟踪的机器标识。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_uid: Option<String>,
 }
 
 impl Device {
@@ -203,7 +223,9 @@ pub struct SyncConfig {
     pub enabled: bool,
     /// HTTP 同步开关
     pub http_enabled: bool,
-    /// 设备发现方式：broadcast / mdns / poll（后续预留）
+    /// 设备发现方式："mdns"（默认，mDNS 优先 + UDP 广播兜底）/ "udp_only"（只跑 UDP 广播，排障用）。
+    /// 老数据库里存的是 "broadcast"，那时它指的就是「自动发现」，语义上等价于新默认值，
+    /// 因此不做迁移也不判断它——除 "udp_only" 以外的一律按默认处理。
     pub discovery_method: String,
     /// 本机同步 HTTP 监听端口（五位数，默认 56001）
     pub listen_port: u16,
@@ -249,7 +271,7 @@ impl Default for SyncConfig {
         SyncConfig {
             enabled: false,
             http_enabled: true,
-            discovery_method: "broadcast".to_string(),
+            discovery_method: "mdns".to_string(),
             listen_port: 5600,
             udp_port: 46000,
             sync_inbox: true,

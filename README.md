@@ -81,4 +81,7 @@ cors_regex = ["chrome-extension://.*"]
 
 ### Syncing
 
-For details about aw-sync-rust, see the [README](./aw-sync/README.md) in its subdirectory.
+LAN device sync lives in [`aw-sync-rust/`](./aw-sync-rust/) — discovery (mDNS preferred,
+UDP broadcast fallback), pairing, encrypted snapshot transport, and the conflict trash.
+Its REST surface is mounted at `/api/0/sync`; the design notes live in the sibling
+`aw-qtui` repo's `docs/` (设备发现 / 信封加密 / 设备身份归并 三篇).

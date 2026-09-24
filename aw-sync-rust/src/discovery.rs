@@ -1,13 +1,15 @@
-//! 设备发现：UDP 广播 / mDNS 自动发现。
+//! 设备发现：两条路径共用同一套入库/仲裁逻辑（见 record_peer）。
 //!
-//! - 通过本地 UDP 广播（固定端口 46000）周期发送自身的设备名、IP、HTTP 同步端口。
-//! - 监听同一端口的广播包，解析对端信息后**自动加入本地永久信任列表**，并刷新在线状态。
+//! - **首选 mDNS/DNS-SD**（`crate::mdns`）：服务类型 `_activitywatch._tcp.local.`，
+//!   SRV 带端口、A 记录带地址，不依赖子网掩码，地址变更与下线有标准语义。
+//! - **备选 UDP 广播**（本文件的 broadcast_loop / listener_loop）：固定端口 46000，
+//!   周期发送自身信息。在组播被 AP 吞掉的环境里它反而更可靠，因此保留。
+//! - 监听到的对端信息**自动加入本地永久信任列表**并刷新在线状态，
 //!   下次同一局域网内无需重复配对。
-//! - mDNS 预留增强接口（后续迭代可用 libmdns 等实现跨网段/Wi-Fi 感知发现）。
 //! - 轮询遍历（poll）本期留空占位。
 
-use chrono::Utc;
-use log::{debug, error, info, warn};
+use chrono::{DateTime, Utc};
+use log::{debug, error, info};
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -27,6 +29,107 @@ const MAGIC: &str = "AW-SYNC/1.0";
 
 /// UDP 广播发现常量
 pub const DEFAULT_UDP_PORT: u16 = 46000;
+
+/// 一条对端宣告的来源。mDNS 为首选，UDP 广播为备选。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerSource {
+    Mdns,
+    UdpBroadcast,
+}
+
+impl PeerSource {
+    /// devices.seen_via 列的取值
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PeerSource::Mdns => "mdns",
+            PeerSource::UdpBroadcast => "udp",
+        }
+    }
+
+    fn protocol(&self) -> SyncProtocol {
+        match self {
+            PeerSource::Mdns => SyncProtocol::Mdns,
+            PeerSource::UdpBroadcast => SyncProtocol::UdpBroadcast,
+        }
+    }
+}
+
+/// mDNS 信息被视为权威的窗口（秒）。
+///
+/// 只要这台设备最近还持续被 mDNS 解析到，迟到的 UDP 广播就不许改写它的 ip/port：
+/// 广播里的自报地址可能来自错误的网卡探测，而 mDNS 的 A 记录 + SRV 端口是权威的。
+/// 超出该窗口说明 mDNS 已经哑了（组播不通 / 对端换网），此时放行广播兜底。
+pub const MDNS_FRESH_SECS: i64 = 45;
+
+/// 来源仲裁：本次宣告能否覆盖已有记录里的 ip/port。
+///
+/// 只有一种组合需要压制：已有记录是 mDNS 报的且仍在新鲜期内，而这次来自 UDP 广播。
+pub fn source_wins(
+    existing: Option<(String, Option<DateTime<Utc>>)>,
+    incoming: PeerSource,
+    now: DateTime<Utc>,
+) -> bool {
+    let (via, seen) = match existing {
+        Some(e) => e,
+        None => return true,
+    };
+    if incoming == PeerSource::UdpBroadcast && via == "mdns" {
+        return match seen {
+            Some(t) => (now - t).num_seconds() >= MDNS_FRESH_SECS,
+            None => true,
+        };
+    }
+    true
+}
+
+/// 把一条对端宣告写进信任列表：来源仲裁 → 落库 → 记发现日志。
+///
+/// 返回 false 表示本次信息被更高优先级来源压制（只刷新在线状态，未改写可达地址）。
+pub fn record_peer(db: &SharedDb, mut dev: Device, via: PeerSource, note: String) -> bool {
+    // 从网络解析出的设备绝不可能是「本机」或「已配对」，在此固化，
+    // 避免对端自带的 is_self/paired 状态污染本地存储。
+    dev.is_self = false;
+    dev.paired = false;
+    let now = Utc::now();
+    dev.last_seen_at = Some(now);
+
+    let guard = match db.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    if !source_wins(guard.device_seen_source(&dev.id).ok().flatten(), via, now) {
+        let _ = guard.touch_seen(&dev.id);
+        debug!("[discovery] {via:?} 落败：{note}");
+        return false;
+    }
+
+    if let Err(e) = guard.upsert_discovered(&dev, via.as_str()) {
+        error!("[discovery] upsert_discovered 失败: {} err={}", dev.id, e);
+        return false;
+    }
+    info!("[aw-sync>discovery] 已把设备 '{}' 加入信任列表", dev.name);
+    // 同类日志 60 秒去抖：宣告是周期性的，不去抖会刷爆同步日志
+    if should_log(&format!("in-{}-{}", via.as_str(), dev.id)) {
+        let entry = SyncLogEntry {
+            id: None,
+            timestamp: now,
+            direction: SyncDirection::In,
+            protocol: via.protocol(),
+            peer_id: Some(dev.id.clone()),
+            event_type: SyncEventType::Discovery,
+            status: SyncStatus::Success,
+            message: Some(note),
+            data_size: None,
+            details: None,
+        };
+        if let Err(e) = guard.add_log(&entry) {
+            error!("[discovery] add_log failed: {e}");
+        }
+    }
+    true
+}
+
 
 /// 本机设备描述（供广播 / 列表展示）；data_dir 用于在广播线程内写同步日志
 pub struct SelfInfo {
@@ -77,6 +180,21 @@ pub fn subnet_broadcast(local_ip: &str) -> Option<String> {
     } else {
         Some(broadcast.to_string())
     }
+}
+
+/// 构造 UDP 宣告报文（`MAGIC\n{json}`）。
+///
+/// 单独抽出来，是因为「什么能进被动广播」是一条安全边界而不是格式细节：
+/// 同网段任何人无需配对就能抓到这些包，所以本机信息在出网前统一脱敏——
+/// name 换成设备 id 的哈希别名（真实主机名往往是 Zhang-PC 这类可识别信息），
+/// 密钥与装机指纹一律清空。真实名字只在配对后的 HTTP 报文里交换；装机指纹
+/// 只随用户主动发起的配对请求走一次（manager::with_outgoing_secret）。
+pub fn announce_payload(device: &Device) -> String {
+    let mut announce = device.clone();
+    announce.name = crate::crypto::hashed_alias(&announce.id);
+    announce.device_secret = None;
+    announce.machine_uid = None;
+    format!("{}\n{}", MAGIC, serde_json::to_string(&announce).unwrap_or_default())
 }
 
 /// 在固定 UDP 端口周期广播本机信息。
@@ -159,37 +277,61 @@ pub fn broadcast_loop(info: SelfInfo, udp_port: u16, interval: Duration) {
             continue;
         }
 
-        let payload = format!("{}\n{}", MAGIC, serde_json::to_string(&device).unwrap_or_default());
+        let payload = announce_payload(&device);
         for tgt in &targets {
             let _ = sock.send_to(payload.as_bytes(), *tgt);
         }
         debug!("[aw-sync] 广播自我信息到 {}", targets[0]);
         // 出站广播报文：60 秒去抖，避免周期包刷屏
-        if should_log(&format!("out-{}", device.id)) {
-            crate::dbglog::info(format!(
-                "[discovery] 发出广播宣告 {}:{} (udp:{})",
-                device.ip, device.port, udp_port
-            ));
-            if let Some(db) = &out_db {
-                let _ = db.add_log(&SyncLogEntry {
-                    id: None,
-                    timestamp: Utc::now(),
-                    direction: SyncDirection::Out,
-                    protocol: SyncProtocol::UdpBroadcast,
-                    peer_id: None,
-                    event_type: SyncEventType::Discovery,
-                    status: SyncStatus::Success,
-                    message: Some(format!(
-                        "发出广播宣告 {}:{} (id:{} udp:{})",
-                        device.ip, device.port, device.id, udp_port
-                    )),
-                    data_size: Some(payload.len() as u64),
-                    details: None,
-                });
-            }
-        }
+        log_announce(
+            out_db.as_ref(),
+            &format!("out-udp-{}", device.id),
+            PeerSource::UdpBroadcast,
+            format!(
+                "发出广播宣告 {}:{} (id:{} udp:{})",
+                device.ip, device.port, device.id, udp_port
+            ),
+            Some(payload.len() as u64),
+        );
         thread::sleep(interval);
     }
+}
+
+/// 出站宣告日志（UDP 广播与 mDNS 注册共用）：按 key 去抖，避免周期性报文刷爆同步日志。
+pub(crate) fn log_announce(
+    db: Option<&SyncDb>,
+    dedup_key: &str,
+    via: PeerSource,
+    msg: String,
+    data_size: Option<u64>,
+) {
+    if !should_log(dedup_key) {
+        return;
+    }
+    crate::dbglog::info(format!("[discovery] {msg}"));
+    if let Some(db) = db {
+        let _ = db.add_log(&SyncLogEntry {
+            id: None,
+            timestamp: Utc::now(),
+            direction: SyncDirection::Out,
+            protocol: via.protocol(),
+            peer_id: None,
+            event_type: SyncEventType::Discovery,
+            status: SyncStatus::Success,
+            message: Some(msg),
+            data_size,
+            details: None,
+        });
+    }
+}
+
+/// 可作为对端同步端点的地址：回环/未指定地址一律不算（写进库就是死地址）。
+pub(crate) fn is_usable_ip(s: &str) -> bool {
+    !s.is_empty()
+        && s != "127.0.0.1"
+        && s != "localhost"
+        && s != "0.0.0.0"
+        && s != "::1"
 }
 
 /// 在固定 UDP 端口监听广播，把发现的设备持久化进信任列表。
@@ -233,61 +375,26 @@ pub fn listener_loop(db: SharedDb, udp_port: u16, self_id: String) {
                     if device.id == self_id {
                         continue; // 忽略自己
                     }
-                    // 对端广播里携带自身的 is_self=true / paired 信息，在本地解析后必须固化：
-                    // - is_self: 对端当然不是本机，强制 false，否则前端 is_self 过滤会在两个列表都藏掉该设备
-                    // - paired:  由 upsert_discovered 决定——新发现保持未配对，已存在的保留其配对状态
+                    // is_self / paired 的固化、在线状态、来源仲裁与日志都在 record_peer 里做，
+                    // mDNS 路径走的是同一个入口，两条路径因此不会各写各的。
                     let mut dev = device;
-                    dev.is_self = false;
-                    dev.paired = false;
-                    dev.last_seen_at = Some(chrono::Utc::now());
                     // 关键：用真正收到包的源 IP 作为该对端的同步地址。
                     // 自报的 dev.ip 可能因本机 IP 探测出错而填错（如填成 VPN 网关/其它网卡），
                     // 但 UDP 包的源地址一定是当前网络下对方真正可达的地址，优先用它。
                     let src_ip = src.ip().to_string();
-                    if !src_ip.is_empty()
-                        && src_ip != "127.0.0.1"
-                        && src_ip != "localhost"
-                        && src_ip != "0.0.0.0"
-                        && src_ip != "::1"
-                    {
+                    if is_usable_ip(&src_ip) && dev.ip != src_ip {
                         crate::dbglog::info(format!(
-                            "[discovery] 收到 {} 的广播，源地址={}，采用源地址作为同步地址（自报 ip={}）",
+                            "[discovery] 收到 {} 的广播，源地址={}\
+                             ，改用源地址（自报 ip={})",
                             dev.name, src_ip, dev.ip
                         ));
                         dev.ip = src_ip;
                     }
-                    crate::dbglog::info(format!(
-                        "[discovery] 发现设备 {}({}) {}:{}，已写入信任列表",
-                        dev.name, dev.id, dev.ip, dev.port
-                    ));
-                    if let Ok(mut db) = db.lock() {
-                        match db.upsert_discovered(&dev) {
-                            Ok(()) => crate::dbglog::info(format!("[discovery] upsert_discovered 成功: {}", dev.id)),
-                            Err(e) => crate::dbglog::error(format!("[discovery] upsert_discovered 失败: {} err={}", dev.id, e)),
-                        }
-                        if !should_log(&format!("in-{}", dev.id)) {
-                            continue; // 去抖窗口内不重复写发现日志
-                        }
-                        let entry = SyncLogEntry {
-                            id: None,
-                            timestamp: chrono::Utc::now(),
-                            direction: SyncDirection::In,
-                            protocol: SyncProtocol::UdpBroadcast,
-                            peer_id: Some(dev.id.clone()),
-                            event_type: SyncEventType::Discovery,
-                            status: SyncStatus::Success,
-                            message: Some(format!(
-                                "收到 {} 的广播报文 ({}:{} id:{})，已加入信任列表",
-                                dev.name, dev.ip, dev.port, dev.id
-                            )),
-                            data_size: None,
-                            details: None,
-                        };
-                        db.add_log(&entry)
-                            .map_err(|e| crate::dbglog::error(format!("[discovery] add_log failed: {}", e)))
-                            .ok();
-                    }
-                    info!("[aw-sync>discovery] 已把设备 '{}' 加入信任列表", dev.name);
+                    let note = format!(
+                        "收到 {} 的广播报文 ({}:{} id:{})",
+                        dev.name, dev.ip, dev.port, dev.id
+                    );
+                    record_peer(&db, dev, PeerSource::UdpBroadcast, note);
                 }
             }
             Err(_) => {}
@@ -323,13 +430,12 @@ pub fn poll_loop(_db: SharedDb, _port: u16, _interval: Duration) {
     warn!("[aw-sync>discovery] 轮询遍历发现尚未实现，已跳过（示意占位）。");
 }
 
-// ================= mDNS（预留） =================
+// ================= mDNS（首选路径） =================
 
-/// mDNS 服务解析：为对端提供查询本机 _aw-sync._tcp.local 的能力。
-/// 本期以 UDP 广播为主，暂未启用真正 mDNS。后续可用 libmdns / mdns-sd 扩展，
-/// 以便支持跨 VLAN / 单播查询。
+/// 首选路径是否可用（mDNS daemon 已就绪）。UDP 广播始终在跑，所以这里 false 只代表
+/// 「暂时退到备选路径」，不代表设备发现整体失效。
 pub fn mdns_available() -> bool {
-    false
+    crate::mdns::daemon_ready()
 }
 
 #[cfg(test)]
@@ -351,6 +457,8 @@ mod tests {
             is_self: false,
             paired: false,
             alias: None,
+            device_secret: None,
+            machine_uid: None,
         };
         let text = serde_json::to_string(&d).unwrap();
         let parsed = parse_device(&text).unwrap();
@@ -373,9 +481,117 @@ mod tests {
                 is_self: false,
                 paired: false,
                 alias: None,
+            device_secret: None,
+            machine_uid: None,
             })
             .unwrap()
         );
         assert!(parse_device(&text).is_some());
+    }
+
+    // ---- 来源仲裁：mDNS 首选、UDP 广播兜底 ----
+
+    fn peer(id: &str, ip: &str) -> Device {
+        Device {
+            id: id.into(),
+            name: crate::crypto::hashed_alias(id),
+            device_kind: crate::models::DeviceKind::Windows,
+            ip: ip.into(),
+            port: crate::DEFAULT_SYNC_PORT,
+            paired_at: chrono::Utc::now(),
+            last_sync_at: None,
+            last_seen_at: None,
+            is_online: true,
+            // 故意带上错误状态：从网络解析出的设备既不是本机也不可能已配对
+            is_self: true,
+            paired: true,
+            alias: None,
+            device_secret: None,
+            machine_uid: None,
+        }
+    }
+
+    fn at(secs_ago: i64) -> DateTime<Utc> {
+        chrono::Utc::now() - chrono::Duration::seconds(secs_ago)
+    }
+
+    #[test]
+    fn source_wins_matrix() {
+        let now = chrono::Utc::now();
+        let udp = PeerSource::UdpBroadcast;
+        let mdns = PeerSource::Mdns;
+        // 从没见过的设备：谁来都能写
+        assert!(source_wins(None, udp, now));
+        // 老库/配对登记（seen_via 为空）或时间无法解析：不锁死更新
+        assert!(source_wins(Some(("".into(), Some(now))), udp, now));
+        assert!(source_wins(Some(("mdns".into(), None)), udp, now));
+        // 只有「新鲜 mDNS 记录 + 迟到的广播」这一种组合会被压制
+        assert!(source_wins(Some(("mdns".into(), Some(at(MDNS_FRESH_SECS - 5)))), udp, now) == false);
+        assert!(source_wins(Some(("mdns".into(), Some(at(MDNS_FRESH_SECS + 5)))), udp, now));
+        assert!(source_wins(Some(("udp".into(), Some(at(0)))), mdns, now), "首选路径永远压过备选");
+        assert!(source_wins(Some(("udp".into(), Some(at(0)))), udp, now), "备选路径之间照常覆盖");
+    }
+
+    #[test]
+    fn fresh_mdns_record_suppresses_broadcast_address() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(Mutex::new(SyncDb::open(dir.path()).unwrap()));
+        assert!(record_peer(&db, peer("B", "10.1.2.3"), PeerSource::Mdns, "解析到 B".into()));
+
+        let mut late = peer("B", "192.168.5.99");
+        late.paired_at = at(99999);
+        assert!(
+            !record_peer(&db, late, PeerSource::UdpBroadcast, "广播 B".into()),
+            "新鲜期内广播不得改写可达地址"
+        );
+
+        let g = db.lock().unwrap();
+        let b = g.get_device("B").unwrap().unwrap();
+        assert_eq!(b.ip, "10.1.2.3");
+        assert_eq!(b.port, crate::DEFAULT_SYNC_PORT);
+        assert_eq!(g.device_seen_source("B").unwrap().unwrap().0, "mdns");
+        assert!(!b.is_self && !b.paired, "宣告自带的 is_self/paired 必须被固化掉");
+    }
+
+    #[test]
+    fn broadcast_takes_over_once_mdns_goes_silent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(Mutex::new(SyncDb::open(dir.path()).unwrap()));
+        // 一条超出新鲜期的 mDNS 记录：组播被 AP 吞掉 / daemon 起不来时的真实形态
+        let mut stale = peer("B", "10.1.2.3");
+        stale.last_seen_at = Some(at(MDNS_FRESH_SECS + 10));
+        db.lock().unwrap().upsert_discovered(&stale, "mdns").unwrap();
+
+        assert!(
+            record_peer(&db, peer("B", "192.168.5.99"), PeerSource::UdpBroadcast, "广播 B".into()),
+            "mDNS 哑了之后广播要能兜底"
+        );
+        let g = db.lock().unwrap();
+        assert_eq!(g.get_device("B").unwrap().unwrap().ip, "192.168.5.99");
+        assert_eq!(g.device_seen_source("B").unwrap().unwrap().0, "udp");
+    }
+
+    /// 关键回归：落败的广播只保留在线状态，不能顺手把 mDNS 的新鲜期续上。
+    ///
+    /// 若新鲜期跟着 last_seen_at 走，每 5 秒一次的广播会把 45 秒窗口无限延长，
+    /// mDNS 真的哑掉后备选路径永远补不进来。
+    #[test]
+    fn losing_broadcast_does_not_extend_mdns_window() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(Mutex::new(SyncDb::open(dir.path()).unwrap()));
+        let mut seen = peer("B", "10.1.2.3");
+        seen.last_seen_at = Some(at(30));
+        db.lock().unwrap().upsert_discovered(&seen, "mdns").unwrap();
+
+        assert!(!record_peer(&db, peer("B", "192.168.5.99"), PeerSource::UdpBroadcast, "广播 B".into()));
+        let g = db.lock().unwrap();
+        let (_, window_start) = g.device_seen_source("B").unwrap().unwrap();
+        let last_seen = g.get_device("B").unwrap().unwrap().last_seen_at;
+        assert!(
+            (chrono::Utc::now() - window_start.unwrap()).num_seconds() >= 25,
+            "仲裁窗口仍是那次 mDNS 解析的时刻，未被广播刷新"
+        );
+        assert!(last_seen.unwrap() > window_start.unwrap(), "在线状态该被广播刷新");
+        assert_eq!(g.device_seen_source("B").unwrap().unwrap().0, "mdns");
     }
 }

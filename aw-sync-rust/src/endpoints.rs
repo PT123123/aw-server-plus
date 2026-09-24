@@ -166,10 +166,11 @@ async fn config_save(state: &State<SharedManager>, cfg: Json<crate::models::Sync
         // - 桌面端：发现常驻（discovery_persistent），配置开启即回到广播状态；
         // - Android 端：仍只由「进入局域网同步界面」驱动（discovery/start），
         //   否则 Wi-Fi 自动开启 enabled 时会在后台偷偷广播。
-        if crate::manager::discovery_persistent()
-            && cfg.enabled
-            && cfg.discovery_method == "broadcast"
-        {
+        //
+        // 不再按 discovery_method 过滤：该字段只决定「mDNS 首选是否参与」（udp_only = 排障时
+        // 关掉 mDNS），UDP 广播始终作为兜底在跑。曾经写死 == "broadcast" 时，默认值改成
+        // "mdns" 后这条分支永远不进，桌面端配置开启后 discovery_running 一直是 false。
+        if crate::manager::discovery_persistent() && cfg.enabled {
             m.start_discovery();
         }
         Ok(serde_json::to_value(m.get_config()).unwrap_or(serde_json::Value::Null))
@@ -245,15 +246,22 @@ type JoinResult = Result<Json<serde_json::Value>, (Status, Json<serde_json::Valu
 async fn join(state: &State<SharedManager>, req: Json<JoinRequest>) -> JoinResult {
     let req = req.into_inner();
     let mgr = state.inner().clone();
+    // 配对码的具体数字不进任何日志（/log 同网段可读）；密钥同样只在报文中出现一次
+    crate::dbglog::info("[pair] /join 收到加入请求");
     // 统一错误载体：(HTTP 状态码, 错误 JSON)
     let joined = tokio::task::spawn_blocking(move || {
-            let req_code_for_log = req.code.clone();
-            crate::dbglog::info(format!("[pair] /join 收到请求: code={}", req.code));
+            let offered = req.device.device_secret.clone();
             let g = mgr.lock().map_err(|_| {
                 (500u16, serde_json::json!({"error": "internal"}))
             })?;
             match g.join_with_code(&req.code, req.device) {
-                Ok(dev) => {
+                Ok(mut dev) => {
+                    // 密钥协商：采纳加入方带来的密钥，没有则由本机生成，随响应回传
+                    let secret = g.adopt_incoming_secret(&dev.id, offered.as_deref()).map_err(|e| {
+                        crate::dbglog::error(format!("[pair] join 密钥协商失败: {e}"));
+                        (500u16, serde_json::json!({"error": "secret_exchange_failed"}))
+                    })?;
+                    dev.device_secret = None;
                     let _ = g.add_log(&SyncLogEntry {
                         id: None,
                         timestamp: chrono::Utc::now(),
@@ -267,26 +275,24 @@ async fn join(state: &State<SharedManager>, req: Json<JoinRequest>) -> JoinResul
                         details: None,
                     });
                     crate::dbglog::info(format!(
-                        "[pair] /join 成功: 已登记 {}({}), 并返回本机信息给对方",
+                        "[pair] /join 成功: 已登记 {}({}), 并返回本机信息+密钥给对方",
                         dev.name, dev.id
                     ));
                     g.save_device(&dev).map_err(|e| {
                         crate::dbglog::error(format!("[pair] join save_device 失败: {e}"));
                         (500u16, serde_json::json!({"error": "internal"}))
                     })?;
-                    let me = g.self_device_info();
+                    let me = g.with_outgoing_secret(&g.self_device_info());
                     Ok(serde_json::json!({
                         "device": serde_json::to_value(dev).unwrap_or(serde_json::Value::Null),
                         // 本机信息：加入方收到后把它存进自己的信任列表，实现双向互见
                         "peer": serde_json::to_value(me).unwrap_or(serde_json::Value::Null),
+                        "device_secret": secret,
                     }))
                 }
                 Err(crate::paircode::PairError::InvalidOrExpiredCode) => {
                     // 用户输入错误：配对码无效或已过期 → 400（而非 500）
-                    crate::dbglog::warn(format!(
-                        "[pair] /join 返回 400: 配对码无效或已过期 (code={})",
-                        req_code_for_log
-                    ));
+                    crate::dbglog::warn("[pair] /join 返回 400: 配对码无效或已过期");
                     Err((
                         400u16,
                         serde_json::json!({
@@ -316,11 +322,28 @@ async fn join(state: &State<SharedManager>, req: Json<JoinRequest>) -> JoinResul
     }
 }
 
+/// 「使用配对码配对」——加入方入口：本机把对端的配对码提交给**对端**服务器。
+/// 与上面的 /join 是一对：/join 由码主接收，/join-remote 由加入方发起。
+#[post("/join-remote", data = "<body>", format = "json")]
+async fn join_remote(state: &State<SharedManager>, body: Json<serde_json::Value>) -> Res {
+    let device_id = body.get("device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    run(state, move |m| {
+        let resp = m.join_remote(&device_id, &code)?;
+        Ok(serde_json::json!({ "ok": true, "peer": resp }))
+    })
+    .await
+}
+
 /// 手动保存/更新一台对端设备到本地信任列表（配对反向登记用）。
 #[post("/devices", data = "<dev>", format = "json")]
 async fn add_device(state: &State<SharedManager>, dev: Json<Device>) -> Res {
     let mut d = dev.into_inner();
     d.is_self = false; // 强制非本机
+    d.device_secret = None; // 密钥只能经配对握手协商，不接受外部塞入
+    // 装机指纹同理：它决定「提示用户把两行并成一行」，能被外部塞入就等于能伪造
+    // 「这是你那台旧平板」，把用户往错误的合并目标上引。只有握手路径可以登记它。
+    d.machine_uid = None;
     run(state, move |m| {
         m.save_device(&d)?;
         Ok(serde_json::json!({ "saved": true, "id": d.id }))
@@ -374,13 +397,25 @@ async fn pair_accept(state: &State<SharedManager>, body: Json<serde_json::Value>
 }
 
 /// 设备间内部端点：收到对方发来的配对请求，记录到待确认列表。body = 对方 Device。
+///
+/// 顺带完成密钥协商：报文里带了合法密钥就采纳（发起方决定），否则本机新生成一把；
+/// 生效的密钥随响应回传给发起方，两端由此收敛到同一把（日志/接口都不暴露它）。
 #[post("/pair/request", data = "<dev>", format = "json")]
 async fn pair_request(state: &State<SharedManager>, dev: Json<Device>) -> Res {
-    let from = dev.into_inner();
+    let mut from = dev.into_inner();
+    let offered = from.device_secret.take();
+    let peer_id = from.id.clone();
     run(state, move |m| {
         m.record_inbound_pair_request(from)?;
-        let me = m.self_device_info();
-        Ok(serde_json::json!({ "ok": true, "me": serde_json::to_value(me).unwrap_or(serde_json::Value::Null) }))
+        let secret = m.adopt_incoming_secret(&peer_id, offered.as_deref())?;
+        // 自报信息带装机指纹：发起方靠它认出「这台被我配过的机器重装了」。
+        // 只在用户主动发起的配对握手往返里带，/info 与广播一律不带。
+        let me = m.with_outgoing_secret(&m.self_device_info());
+        Ok(serde_json::json!({
+            "ok": true,
+            "me": serde_json::to_value(me).unwrap_or(serde_json::Value::Null),
+            "device_secret": secret,
+        }))
     })
     .await
 }
@@ -388,14 +423,16 @@ async fn pair_request(state: &State<SharedManager>, dev: Json<Device>) -> Res {
 /// 设备间内部端点：收到对方确认配对，把对方标记为已配对。body = 对方 Device。
 #[post("/pair/confirm", data = "<dev>", format = "json")]
 async fn pair_confirm(state: &State<SharedManager>, dev: Json<Device>) -> Res {
-    let peer = dev.into_inner();
+    let mut peer = dev.into_inner();
+    let offered = peer.device_secret.take();
+    let peer_id = peer.id.clone();
     run(state, move |m| {
-        // 确保对方已在信任列表（若尚未发现则补登记）
-        if m.get_device(&peer.id)?.is_none() {
-            let mut p = peer.clone();
-            p.is_self = false;
-            m.save_device(&p)?;
-        }
+        // 登记/刷新对方：广播里只有哈希别名，配对报文的真名与可达地址要落到信任列表
+        let mut p = peer.clone();
+        p.is_self = false;
+        m.refresh_peer_from_handshake(&p)?;
+        // 密钥对齐：以本机已有/新生成的为准，回传后双方一致
+        let secret = m.adopt_incoming_secret(&peer_id, offered.as_deref())?;
         // 记录到同步日志（显示报文） - 接收的确认
         let log_entry = SyncLogEntry {
             id: None,
@@ -418,18 +455,25 @@ async fn pair_confirm(state: &State<SharedManager>, dev: Json<Device>) -> Res {
         if let Ok(mut m) = m.inbound_pair_requests.lock() {
             let _ = m.remove(&peer.id);
         }
-        Ok(serde_json::json!({ "ok": true }))
+        // 对方（发起方）也想知道本机是谁：回一份自报信息，双方名字才能对得上
+        let me = m.with_outgoing_secret(&m.self_device_info());
+        Ok(serde_json::json!({
+            "ok": true,
+            "me": serde_json::to_value(me).unwrap_or(serde_json::Value::Null),
+            "device_secret": secret,
+        }))
     })
     .await
 }
 
 // ---- 设备 -
-
 #[get("/devices")]
 async fn devices(state: &State<SharedManager>) -> Res {
     run(state, |m| {
         let list = m.list_devices().map_err(|e| e.to_string())?;
-        // 为每个设备附带「是否有待本机确认的配对请求」，供前端显示「接受配对」按钮
+        // 安全码表：只有已交换过密钥的对端才有值。密钥本身绝不进这个响应
+        // （桌面端监听 0.0.0.0，同网段任何人都能读 /devices）。
+        let fps = m.security_fingerprints();
         let out: Vec<serde_json::Value> = list
             .iter()
             .map(|d| {
@@ -439,6 +483,20 @@ async fn devices(state: &State<SharedManager>) -> Res {
                         "incoming_pair_request".into(),
                         serde_json::json!(m.has_inbound_pair_request(&d.id)),
                     );
+                    map.insert(
+                        "encrypted".into(),
+                        serde_json::json!(fps.contains_key(&d.id)),
+                    );
+                    // 装机指纹相同 = 疑似同一台机器换了 device_id（升级/重装）。两种时刻
+                    // 都要提示：它正带着指纹请求配对；或列表里已经躺着两行同指纹的设备。
+                    // 没有指纹的行（未配对、纯被发现）在 merge_candidate_for 里一次索引
+                    // 查询都不做就返回 None。命中也只给提示，合并与否由用户点。
+                    if let Some(c) = m.merge_candidate_for(&d.id) {
+                        map.insert("merge_candidate".into(), c);
+                    }
+                    if let Some(fp) = fps.get(&d.id) {
+                        map.insert("fingerprint".into(), serde_json::json!(fp));
+                    }
                 }
                 v
             })
@@ -486,6 +544,70 @@ async fn device_delete(state: &State<SharedManager>, id: String) -> Res {
             details: None,
         });
         Ok(serde_json::json!({ "deleted": removed }))
+    })
+    .await
+}
+
+/// 与 [`run`] 同构，但把失败原因写进响应体。
+///
+/// 只给归并/清理这类「用户点一下」的端点用：它们的拒绝几乎都是条件不成立
+/// （这一行已被归并过、候选刚刚消失），裸 500 会让两端 toast 显示成「服务器错误 (500)」，
+/// 用户不知道刚才那一下到底成没成。内部故障仍回 500，只是同样带上可读的文案。
+type VerboseRes = std::result::Result<Json<serde_json::Value>, (Status, Json<serde_json::Value>)>;
+
+fn err_with(status: Status, msg: impl ToString) -> (Status, Json<serde_json::Value>) {
+    (status, Json(serde_json::json!({ "error": msg.to_string() })))
+}
+
+async fn run_verbose<F>(state: &State<SharedManager>, f: F) -> VerboseRes
+where
+    F: FnOnce(&SyncManager) -> Result<serde_json::Value, String> + Send + 'static,
+{
+    let mgr = state.inner().clone();
+    tokio::task::spawn_blocking(move || match mgr.lock() {
+        Err(_) => Err(err_with(
+            Status::InternalServerError,
+            "同步管理器暂不可用，请重试",
+        )),
+        Ok(guard) => f(&guard).map(Json).map_err(|e| {
+            log::error!("[aw-sync] handler error: {e}");
+            err_with(Status::BadRequest, e)
+        }),
+    })
+    .await
+    .map_err(|_| err_with(Status::InternalServerError, "内部错误"))?
+}
+
+/// 把一行归并进另一行（界面上「这台设备和旧记录疑似同一台机器，合并？」点了「合并」）。
+///
+/// 方向固定 `from` = 换 id 之前的旧行、`to` = 现在活着的行：旧行那个 device_id 已经
+/// 不会再有任何报文上来，留下只会一直显示离线。
+/// 只改显示与归因：旧行打 superseded_by、旧 id 的密钥作废、记一条 old→new 别名。
+/// 配对本身与密钥一律各归各的，安全码该比还是要比（见 machine_uid 模块的两条纪律）。
+#[post("/merge", data = "<body>", format = "json")]
+async fn device_merge(state: &State<SharedManager>, body: Json<serde_json::Value>) -> VerboseRes {
+    let from = body.get("from").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let to = body.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    run_verbose(state, move |m| {
+        if from.is_empty() || to.is_empty() {
+            return Err("需要 from 与 to 两个设备 id".to_string());
+        }
+        m.merge_devices(&from, &to)?;
+        Ok(serde_json::json!({ "ok": true, "merged_from": from, "merged_into": to }))
+    })
+    .await
+}
+
+/// 「一键清理」：淘汰静默已久的未配对发现行 + 删掉 N 天没同步成功过的旧配对。
+/// body 可选 `{"stale_days": 30}`；未配对行的静默阈值由服务端常量决定，不受此参数影响。
+#[post("/devices/purge", data = "<body>", format = "json")]
+async fn devices_purge(state: &State<SharedManager>, body: Json<serde_json::Value>) -> VerboseRes {
+    let days = body.get("stale_days").and_then(|v| v.as_i64()).unwrap_or(30);
+    run_verbose(state, move |m| {
+        let (discovered, paired) = m.purge_stale_devices(days)?;
+        Ok(serde_json::json!({
+            "ok": true, "discovered_removed": discovered, "paired_removed": paired,
+        }))
     })
     .await
 }
@@ -638,10 +760,17 @@ async fn log_clear(state: &State<SharedManager>) -> Res {
 
 // ---- 对端写入（供其它设备推送） ----
 
-#[post("/push", data = "<snap>", format = "json")]
-async fn push(state: &State<SharedManager>, snap: Json<SyncSnapshot>) -> Res {
-    let snap = snap.into_inner();
+/// 对端推送入口。body 直接收原始字节：明文快照可能有几十 MB，
+/// 而 Rocket 的 `String`/`json` 之外的数据上限默认只有 8KiB（bytes/string 档）。
+#[post("/push", data = "<body>", format = "json")]
+async fn push(state: &State<SharedManager>, body: rocket::data::Capped<Vec<u8>>) -> Res {
+    let Ok(raw) = std::str::from_utf8(&body.value) else {
+        return Err(Status::BadRequest);
+    };
+    let raw = raw.to_string();
     run(state, move |m| {
+        // body 可能是明文快照（旧端 / 未配对），也可能是 {v,kid,ts,n,ct} 信封
+        let snap = m.decode_snapshot_body(&raw, crate::crypto::PATH_PUSH)?;
         let applied = m.apply_snapshot(&snap)?;
         crate::dbglog::info(format!("[push] /push 处理完成: 应用记录数 {}", applied.applied));
         let peer_id = snap.source_device.as_ref().map(|d| d.id.clone());
@@ -692,15 +821,21 @@ async fn push(state: &State<SharedManager>, snap: Json<SyncSnapshot>) -> Res {
 //   1. GET  /snapshot：导出本机快照（含 source_device）；
 //   2. POST /apply  ：把「从对端拉来的快照」合并进本机（与 /push 复用同一 apply_snapshot）。
 
-#[get("/snapshot")]
-async fn snapshot(state: &State<SharedManager>) -> Res {
-    run(state, |m| {
+/// 导出本机快照。`from` = 请求方的设备 id（谁在拉我）：
+/// 本机与该 id 有共享密钥时，响应体整个换成信封；没有则仍返回明文（旧端/热点直连）。
+/// `from` 无需可信：它只用来**选**密钥，选错就解不开，拉取端会直接判定失败。
+#[get("/snapshot?<from>")]
+async fn snapshot(state: &State<SharedManager>, from: Option<String>) -> Res {
+    run(state, move |m| {
         let mut snap = SyncSnapshot {
             source_device: Some(m.self_device_info()),
             ..Default::default()
         };
         m.export(&mut snap);
-        Ok(serde_json::to_value(snap).unwrap_or(serde_json::Value::Null))
+        let body = m.encode_snapshot_body(from.as_deref(), crate::crypto::PATH_SNAPSHOT, &snap)?;
+        let value: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("快照序列化失败: {e}"))?;
+        Ok(value)
     })
     .await
 }
@@ -723,6 +858,8 @@ async fn apply(state: &State<SharedManager>, snap: Json<SyncSnapshot>) -> Res {
             is_self: false,
             paired: false,
             alias: None,
+            device_secret: None,
+            machine_uid: None,
         });
         // 若对端尚未在信任列表，自动加入
         if !peer.id.is_empty() {
@@ -759,6 +896,71 @@ async fn apply(state: &State<SharedManager>, snap: Json<SyncSnapshot>) -> Res {
         Ok(serde_json::json!({ "applied": applied.applied, "result": applied }))
     })
     .await
+}
+
+/// 热点传输的回程推送：客户端只说「把本机快照推到 ip:port」，导出 + 信封化 + HTTP 全在 Rust 做。
+///
+/// 为什么不给 Kotlin/Qt 自己 POST /push：`/push` 现在拒收「已协商密钥却仍是明文」的降级报文，
+/// 而密钥按设计从不出服务端接口，手搓 HTTP 的客户端根本拿不到。让本机代发，
+/// 两端就能继续复用同一套策略：已配对 → 信封，未配对 → 明文（与旧行为一致）。
+#[derive(Deserialize)]
+struct PushToRequest {
+    ip: String,
+    port: u16,
+    /// 对端设备 id（热点场景可从对端 /snapshot 的 source_device.id 取到）；
+    /// 只用于**选**密钥，选不到就退回明文，选错则对端解不开并报错。
+    #[serde(default)]
+    device_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[post("/push-to", data = "<req>", format = "json")]
+async fn push_to(state: &State<SharedManager>, req: Json<PushToRequest>) -> Res {
+    let Json(req) = req;
+    if req.ip.trim().is_empty() || req.port == 0 {
+        return Err(Status::BadRequest);
+    }
+    let mgr = state.inner().clone();
+    // 快照可能有几十 MB，推送又是 60s 级阻塞请求：学 sync_now 分阶段拿锁，别把同步接口饿死
+    tokio::task::spawn_blocking(move || {
+        let target_id = req.device_id.clone().unwrap_or_default();
+        let target_name = req.name.clone().unwrap_or_default();
+        let (snap, secret) = {
+            let g = mgr.lock().map_err(|_| Status::InternalServerError)?;
+            let mut snap = SyncSnapshot {
+                source_device: Some(g.self_device_info()),
+                ..Default::default()
+            };
+            g.export(&mut snap);
+            let secret = if target_id.is_empty() { None } else { g.device_secret(&target_id) };
+            (snap, secret)
+        };
+        let target = Device {
+            id: if target_id.is_empty() { format!("hotspot-{}", req.ip) } else { target_id },
+            name: if target_name.is_empty() { req.ip.clone() } else { target_name },
+            device_kind: crate::models::DeviceKind::Unknown,
+            ip: req.ip,
+            port: req.port,
+            paired_at: Utc::now(),
+            last_sync_at: None,
+            last_seen_at: None,
+            is_online: true,
+            is_self: false,
+            paired: false,
+            alias: None,
+            device_secret: None,
+            machine_uid: None,
+        };
+        let applied = crate::transport::push_snapshot(&target, &snap, secret.as_deref())
+            .map_err(|e| {
+                log::error!("[aw-sync] /push-to 推送失败: {e}");
+                Status::InternalServerError
+            })?;
+        Ok(Json(serde_json::json!({ "applied": applied, "encrypted": secret.is_some() })))
+    })
+    .await
+    .map_err(|_| Status::InternalServerError)?
 }
 
 // ---- 回收站（trash，P0）----
@@ -879,12 +1081,13 @@ pub fn mount_rocket(rocket: Rocket<Build>, mgr: SharedManager) -> Rocket<Build> 
             "/api/0/sync",
             routes![
                 root, info, config, config_save, discovery_start, discovery_stop, discovery_burst,
-                create_paircode, join,
+                create_paircode, join, join_remote,
                 pair_initiate, pair_accept, pair_request, pair_confirm,
                 devices, add_device,
                 sync_now, device_delete, device_alias, devices_clear_all,
+                device_merge, devices_purge,
                 device_stats, device_conflicts,
-                logs, log_clear, push, apply, snapshot, debug_log, status, revision,
+                logs, log_clear, push, push_to, apply, snapshot, debug_log, status, revision,
                 trash_list, trash_restore, trash_delete, trash_clear_all,
                 d1_test, d1_status, d1_sync_now, d1_full_sync, d1_reset, d1_logs
             ],

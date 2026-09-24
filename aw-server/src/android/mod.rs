@@ -734,6 +734,28 @@ pub mod android {
         aw_sync_rust::set_local_ip_override(ip);
     }
 
+    /// 由 Android 侧注入 ANDROID_ID 作为装机指纹的原始值（Rust 读不到等价稳定值）。
+    /// 派生算法只留在 Rust 一份（见 aw_sync_rust::machine_uid）。它既不是凭据也不会被
+    /// 广播出去，只用来在设备列表里提示「这台换了 device_id 的设备疑似某台已配设备的重装」。
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_setSyncMachineUid(
+        env: JNIEnv,
+        _: JClass,
+        java_raw: JString,
+    ) {
+        debug!("[AW_SYNC] setSyncMachineUid 开始执行...");
+        let raw = match env.get_string(java_raw) {
+            Ok(s) => s.to_string_lossy().to_string(),
+            Err(e) => {
+                error!("[AW_SYNC] setSyncMachineUid 解析 JString 失败: {:?}", e);
+                return;
+            }
+        };
+        // 原始值本身不进日志：那是个可跟踪的机器标识
+        debug!("[AW_SYNC] setSyncMachineUid 收到 {} 字节原始标识", raw.len());
+        aw_sync_rust::set_machine_uid_raw("android", &raw);
+    }
+
     #[no_mangle]
     pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_getBuckets(
         env: JNIEnv,

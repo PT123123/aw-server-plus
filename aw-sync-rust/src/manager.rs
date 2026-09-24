@@ -152,6 +152,186 @@ impl SyncManager {
     }
 
 
+    // ---- 信封加密密钥（B 方案，详见 crypto 模块）----
+
+    /// 本机与某对端当前生效的共享密钥；None = 从未交换过（旧端）→ 报文体走明文回退。
+    pub fn device_secret(&self, peer_id: &str) -> Option<String> {
+        self.db().get_device_secret(peer_id).ok().flatten()
+    }
+
+    /// 处理入站配对/加入报文携带的密钥：报文里有合法密钥就采纳（发起方决定），
+    /// 没有或不可用则本机新生成一把；结果落库并原样回传给对方。
+    /// 两端由此收敛到同一把密钥，重新配对即轮换。
+    pub fn adopt_incoming_secret(&self, peer_id: &str, offered: Option<&str>) -> Result<String, String> {
+        let secret = match offered {
+            Some(s) if crate::crypto::secret_ok(s) => s.to_string(),
+            _ => crate::crypto::generate_secret(),
+        };
+        self.db()
+            .set_device_secret(peer_id, &secret)
+            .map_err(|e| e.to_string())?;
+        Ok(secret)
+    }
+
+    /// 采纳对端响应里回传的密钥（以对端为准，双方才会一致）。
+    /// 旧端响应没有 device_secret 字段：保持现状（可能已有密钥，也可能继续明文）。
+    pub fn absorb_secret_from(&self, peer_id: &str, resp: &serde_json::Value) {
+        let Some(s) = resp.get("device_secret").and_then(|v| v.as_str()) else {
+            return;
+        };
+        if !crate::crypto::secret_ok(s) {
+            crate::dbglog::warn(format!("[crypto] 对端 {peer_id} 回传的密钥格式非法，已忽略"));
+            return;
+        }
+        let owned = s.to_string();
+        let _ = self.db().set_device_secret(peer_id, &owned).map_err(|e| {
+            crate::dbglog::error(format!("[crypto] 保存对端密钥失败 {peer_id}: {e}"));
+            e
+        });
+    }
+
+    /// 用配对握手里对端自报的信息刷新本地登记（真实设备名/可达地址）。
+    ///
+    /// 为什么必要：UDP 广播出于被动抓包考虑只带哈希别名，配对前设备列表里就是一串
+    /// 十六进制；配对的 HTTP 报文才带真名。保留本机侧的 alias（用户自己设的别名
+    /// 不能被对端自报名覆盖）与 paired / last_sync_at。
+    pub fn refresh_peer_from_handshake(&self, dev: &Device) -> Result<(), String> {
+        let mut d = dev.clone();
+        d.is_self = false;
+        d.device_secret = None;
+        if let Some(existing) = self.get_device(&d.id).map_err(|e| e.to_string())? {
+            d.paired = existing.paired;
+            d.alias = existing.alias;
+            if d.last_sync_at.is_none() {
+                d.last_sync_at = existing.last_sync_at;
+            }
+        }
+        self.save_device(&d)
+    }
+
+    /// 从配对/加入响应里取出对端自报的本机信息（/pair/request 用 "me"、/join 用 "peer"）
+    /// 并登记到信任列表。
+    pub fn absorb_peer_from(&self, resp: &serde_json::Value) {
+        for key in ["me", "peer"] {
+            let Ok(dev) = serde_json::from_value::<Device>(match resp.get(key) {
+                Some(v) => v.clone(),
+                None => continue,
+            }) else {
+                continue;
+            };
+            if dev.id.is_empty() || dev.id == self.self_id {
+                continue;
+            }
+            if let Err(e) = self.refresh_peer_from_handshake(&dev) {
+                crate::dbglog::warn(format!("[pair] 登记对端自报信息失败 {}: {e}", dev.id));
+            }
+        }
+    }
+
+    /// 出站配对报文：附上本机的装机指纹。
+    ///
+    /// 这是 machine_uid **唯一的出站口子**，调用点全在用户主动发起的配对握手上来回：
+    /// 请求侧三处（initiate / confirm / join_remote），响应侧三处（/join、/pair/request、
+    /// /pair/confirm 回的自报信息）。少了响应侧那三处，四个配对方向里只有「码主记下
+    /// 加入方」这一条能落到库，另一台机器的旧行就永远等不到归并提示。
+    /// 广播走 discovery::announce_payload 的脱敏（抹掉 name/密钥/指纹），/devices 与
+    /// /info 走 storage::row_to_device / self_device_info（指纹恒为 None），
+    /// 两条被动路径都刻意不给它出机的机会。
+    ///
+    /// 关于 device_secret 这一行要说实话：`d` 传进来的始终是**本机**自报信息，
+    /// 于是这里查的是 `device_secrets[本机 id]` —— 那张表按对端 id 存，所以恒为 None。
+    /// 即「发起方带上已有密钥」这件事从来没有发生过，密钥一律由收方现生成
+    /// （adopt_incoming_secret 走 set_device_secret 覆盖，所以每次重新配对必然轮换）。
+    /// 行为本身自洽（两端仍收敛到同一把），只是和早期注释的设想不同；改它要先定
+    /// 「重配对该不该保留旧密钥」，不在本次归并改动范围内。
+    pub fn with_outgoing_secret(&self, peer: &Device) -> Device {
+        let mut d = peer.clone();
+        d.device_secret = self.device_secret(&d.id);
+        d.machine_uid = crate::machine_uid::machine_uid();
+        d
+    }
+
+    /// 这台对端是否「疑似某台已配设备的重装」。命中有两种时刻：
+    /// ① 它正带着指纹请求配对（接受之前就能提示）；② 列表里已经躺着两行同指纹的设备
+    /// （升级/重装后各配了一次，正是用户抱怨的那种乱）。
+    ///
+    /// 命中只产出一条 UI 提示（含旧行的短指纹片段，供人眼对照），**不改变配对结果、
+    /// 不省掉安全码比对**。同机双实例的指纹完全相同，所以自动折叠是错的，必须人点。
+    pub fn merge_candidate_for(&self, peer_id: &str) -> Option<serde_json::Value> {
+        // 指纹来源：① 内存里那份待确认请求（还没入库）；② 库里这一行自己的
+        // （只有配对过的行才会被登记指纹，见 with_outgoing_secret 的四条握手路径）。
+        let uid = self
+            .inbound_pair_requests
+            .lock()
+            .ok()
+            .and_then(|m| m.get(peer_id).and_then(|d| d.machine_uid.clone()))
+            .or_else(|| self.db().machine_uid_of(peer_id).ok().flatten())?;
+        let old = self.db().find_merge_candidate(&uid, peer_id).ok().flatten()?;
+        // 提示只挂在「配对较晚的那一行」上：两行互为候选会让界面上冒出两个合并按钮，
+        // 而用户要做的决定其实只有一个——旧行并进来，活着的这个 id 留下。
+        if let Some(me) = self.db().get_device(peer_id).ok().flatten().filter(|d| d.paired) {
+            if me.paired_at <= old.paired_at {
+                return None;
+            }
+        }
+        // 只回前 8 个 hex：界面要的是「这两行是不是同一个」，不是可跟踪的完整标识
+        //（/devices 同网段任何人可读）。
+        Some(serde_json::json!({
+            "id": old.id,
+            "name": old.name,
+            "alias": old.alias,
+            "uid_hint": &uid[..uid.len().min(8)],
+            "paired_at": old.paired_at.to_rfc3339(),
+            "last_sync_at": old.last_sync_at.map(|t| t.to_rfc3339()),
+            "since_paired_days": (Utc::now() - old.paired_at).num_days(),
+        }))
+    }
+
+    /// 安全码表：peer_id → 4 位十六进制。只暴露指纹，密钥永不出接口。
+    pub fn security_fingerprints(&self) -> std::collections::HashMap<String, String> {
+        self.db().fingerprints(&self.self_id)
+    }
+
+    /// 解一个快照类请求体（/push）：信封按 kid 查密钥解开；明文则要求本机与该发送方
+    /// 从未交换过密钥（否则视为降级攻击）。成功时顺带写一条传输方式日志。
+    pub fn decode_snapshot_body(&self, raw: &str, path: &str) -> Result<SyncSnapshot, String> {
+        let kid = crate::crypto::envelope_kid(raw);
+        let secret = kid.as_ref().and_then(|k| self.device_secret(k));
+        let plain = match &kid {
+            Some(_) => crate::crypto::open_body(secret.as_deref(), path, raw)
+                .map_err(|e| format!("信封报文处理失败: {e}"))?,
+            // 明文：先解析出发送方，再判断是否允许明文
+            None => {
+                let snap: SyncSnapshot =
+                    serde_json::from_str(raw).map_err(|e| format!("快照 JSON 解析失败: {e}"))?;
+                if let Some(dev) = &snap.source_device {
+                    if self.device_secret(&dev.id).is_some() {
+                        return Err(format!(
+                            "已与 {} 协商加密密钥，拒收明文报文（防止中间人降级）",
+                            dev.id
+                        ));
+                    }
+                }
+                raw.to_string()
+            }
+        };
+        serde_json::from_str(&plain).map_err(|e| format!("解密后快照解析失败: {e}"))
+    }
+
+    /// 出站快照响应（/snapshot）：知道请求方是谁（?from=）且与之有共享密钥就封成信封，
+    /// 否则返回明文 —— 拉取端会做同样的对称校验。
+    pub fn encode_snapshot_body(
+        &self,
+        requester_id: Option<&str>,
+        path: &str,
+        snap: &SyncSnapshot,
+    ) -> Result<String, String> {
+        let plain = serde_json::to_string(snap).map_err(|e| e.to_string())?;
+        let secret = requester_id.and_then(|id| self.device_secret(id));
+        crate::crypto::seal_body(secret.as_deref(), path, &self.self_id, &plain)
+    }
+
+
 
     // ---- 设备 ----
 
@@ -188,6 +368,41 @@ impl SyncManager {
             m.clear();
         }
         Ok(n)
+    }
+
+    /// 把 from 行归并进 to 行（用户在「疑似同一台机器」提示里点了「合并」）。
+    /// 落库语义与前置校验见 storage::merge_device；这里只补一句日志。
+    pub fn merge_devices(&self, from: &str, to: &str) -> Result<(), String> {
+        self.db().merge_device(from, to)?;
+        // 归并会少一行，必须在同步日志里留痕，否则用户只会问「我的设备怎么不见了」。
+        let _ = self.add_log(&SyncLogEntry {
+            id: None,
+            timestamp: Utc::now(),
+            direction: SyncDirection::In,
+            protocol: SyncProtocol::Http,
+            peer_id: Some(to.to_string()),
+            event_type: SyncEventType::Pairing,
+            status: SyncStatus::Success,
+            message: Some(format!("已把 {from} 归并进 {to}（装机指纹相同，判定为同一台机器）")),
+            data_size: None,
+            details: None,
+        });
+        crate::dbglog::info(format!("[pair] 已把 {from} 归并进 {to}（旧行保留用于历史归因）"));
+        Ok(())
+    }
+
+    /// 「一键清理」：两件事一次做完，返回 (清掉的发现行数, 清掉的旧配对数)。
+    ///
+    /// 未配对行按服务端常量淘汰（周期性的探活循环本来就在做，这里只是让界面能立刻
+    /// 给出反馈）；旧配对按用户指定的天数删，`last_sync_at` 为空的不动。
+    pub fn purge_stale_devices(&self, days: i64) -> Result<(usize, usize), String> {
+        let db = self.db();
+        let discovered = db.purge_discovered().map_err(|e| e.to_string())?;
+        let paired = db.purge_stale_paired(days).map_err(|e| e.to_string())?;
+        crate::dbglog::info(format!(
+            "[sync] 清理：淘汰 {discovered} 条静默发现行，删除 {paired} 条 {days} 天未同步的旧配对"
+        ));
+        Ok((discovered, paired))
     }
 
 
@@ -348,20 +563,21 @@ impl SyncManager {
     ) -> Result<ApplyResult, String> {
         let lock_err = || "同步管理器锁不可用".to_string();
 
-        // ① 取对端（短锁）
-        let peer = {
+        // ① 取对端 + 本机与之的共享密钥（短锁）。没有密钥 = 旧端/尚未交换 → 明文回退。
+        let (peer, secret, self_id) = {
             let g = mgr.lock().map_err(|_| lock_err())?;
-            g.get_device(peer_id)?.ok_or("未找到目标设备")?
+            let peer = g.get_device(peer_id)?.ok_or("未找到目标设备")?;
+            let secret = g.device_secret(&peer.id);
+            (peer, secret, g.self_id.clone())
         };
 
         // ② 拉取对端快照（不持锁）
-        let remote = crate::transport::fetch_snapshot(&peer)?;
+        let remote = crate::transport::fetch_snapshot(&peer, secret.as_deref(), &self_id)?;
 
         // ③ 合并进本地（短锁）
-        let (applied, self_id) = {
+        let applied = {
             let g = mgr.lock().map_err(|_| lock_err())?;
-            let applied = g.apply_snapshot(&remote)?;
-            (applied, g.self_id.clone())
+            g.apply_snapshot(&remote)?
         };
 
         // ④ 导出本地（短锁，含新合并内容；对端侧合并为幂等，可安全重推）
@@ -376,7 +592,7 @@ impl SyncManager {
         };
 
         // ⑤ 推送给对端（不持锁）
-        let pushed = crate::transport::push_snapshot(&peer, &snap).unwrap_or(0);
+        let pushed = crate::transport::push_snapshot(&peer, &snap, secret.as_deref()).unwrap_or(0);
 
         // ⑥ 登记与日志（短锁）
         let size = snap
@@ -439,6 +655,9 @@ impl SyncManager {
 
         let me = self.self_device_info();
 
+        // 首次配对本机没有密钥：由对端生成并随响应回传；再次配对则带上已有密钥（轮换）
+        let me_wire = self.with_outgoing_secret(&me);
+
         let url = format!("{}/pair/request", peer.endpoint());
 
         let payload = serde_json::to_string(&me).unwrap_or_default();
@@ -446,8 +665,16 @@ impl SyncManager {
         log::info!("[aw-sync] initiate_pair: 目标设备={}, ip={}, port={}", peer.name, peer.ip, peer.port);
 
         let detail = format!(
-            "本机({}) 向 {}({}) 发起配对请求\n目标: {} ({}:{})\nURL: {}\n请求体: {}",
-            self.self_id, peer.name, peer.id, peer.name, peer.ip, peer.port, url, payload
+            "本机({}) 向 {}({}) 发起配对请求\n目标: {} ({}:{})\nURL: {}\n请求体: {}{}",
+            self.self_id,
+            peer.name,
+            peer.id,
+            peer.name,
+            peer.ip,
+            peer.port,
+            url,
+            payload,
+            if me_wire.device_secret.is_some() { "\n密钥: 随报文附带（日志不落密钥）" } else { "\n密钥: 本次由对端生成后交换" }
         );
 
         match self.add_log(&SyncLogEntry {
@@ -466,7 +693,18 @@ impl SyncManager {
             Err(e) => log::error!("[aw-sync] initiate_pair: add_log 失败: {}", e),
         }
 
-        let resp = crate::transport::send_pair_request(&peer, &me)?;
+        let resp = crate::transport::send_pair_request(&peer, &me_wire)?;
+
+        // 对端回传它采纳/生成的那把密钥：以对端为准存下，两端由此一致
+        self.absorb_secret_from(peer_id, &resp);
+        self.absorb_peer_from(&resp);
+        let mut resp = resp;
+        if let Some(code) = self.security_fingerprints().get(peer_id).cloned() {
+            if !resp.is_object() {
+                resp = serde_json::json!({});
+            }
+            resp["fingerprint"] = serde_json::json!(code);
+        }
 
         crate::dbglog::info(format!("[pair] 已向 {} 发起配对请求", peer.name));
 
@@ -513,6 +751,8 @@ impl SyncManager {
     pub fn confirm_pair_with(&self, peer_id: &str) -> Result<serde_json::Value, String> {
         let peer = self.get_device(peer_id)?.ok_or("未找到目标设备")?;
         let me = self.self_device_info();
+        // 本机可能已握着密钥（对方发起配对时交换的），带上让对方对齐；没有则让对方生成
+        let me_wire = self.with_outgoing_secret(&me);
         let url = format!("{}/pair/confirm", peer.endpoint());
         let payload = serde_json::to_string(&me).unwrap_or_default();
         self.add_log(&SyncLogEntry {
@@ -524,22 +764,74 @@ impl SyncManager {
             event_type: SyncEventType::Pairing,
             status: SyncStatus::Success,
             message: Some(format!(
-                "本机({}) 确认与 {}({}) 配对\nURL: {}\n请求体: {}",
-                self.self_id, peer.name, peer.id, url, payload
+                "本机({}) 确认与 {}({}) 配对\nURL: {}\n请求体: {}{}",
+                self.self_id,
+                peer.name,
+                peer.id,
+                url,
+                payload,
+                if me_wire.device_secret.is_some() { "\n密钥: 随报文附带（日志不落密钥）" } else { "\n密钥: 本次由对端生成后交换" }
             )),
             data_size: Some(payload.len() as u64),
             details: None,
         }).ok();
-        let resp = crate::transport::confirm_pair(&peer, &me)?;
+        let resp = crate::transport::confirm_pair(&peer, &me_wire)?;
+        self.absorb_secret_from(peer_id, &resp);
+        self.absorb_peer_from(&resp);
         self.mark_paired(peer_id, true)?;
         // 清除待确认记录
         if let Ok(mut m) = self.inbound_pair_requests.lock() {
             m.remove(peer_id);
         }
-        crate::dbglog::info(format!("[pair] 已与 {} 完成配对", peer.name));
+        let fp = self.security_fingerprints().get(peer_id).cloned();
+        crate::dbglog::info(format!(
+            "[pair] 已与 {} 完成配对；安全码 {}（请与对端屏幕上显示的核对一致）",
+            peer.name,
+            fp.as_deref().unwrap_or("（尚无密钥，未加密同步）")
+        ));
+        // 安全码回给本机前端，同步页据此提示人工比对
+        let mut resp = resp;
+        if let Some(code) = fp {
+            if !resp.is_object() {
+                resp = serde_json::json!({});
+            }
+            resp["fingerprint"] = serde_json::json!(code);
+        }
         Ok(resp)
     }
 
+
+    /// 「使用配对码配对」的加入方一侧：把配对码提交给**对端**服务器。
+    ///
+    /// 注意必须打到对端的 /join：配对码存在创建方（码主）的 sync.db 里，
+    /// 打给本机只会得到一个「配对码无效」——码主永远收不到你。
+    /// 成功响应含 `{device, peer, device_secret}`：peer 是码主自报的信息，
+    /// 登记进本机信任列表并与之共享这把新密钥。
+    pub fn join_remote(&self, peer_id: &str, code: &str) -> Result<serde_json::Value, String> {
+        let peer = self
+            .get_device(peer_id)?
+            .ok_or("未找到目标设备，请先在局域网中让它出现在设备列表里")?;
+        let me = self.with_outgoing_secret(&self.self_device_info());
+        let resp = crate::transport::join_with_code(&peer, code.trim(), &me)?;
+        self.absorb_secret_from(&peer.id, &resp);
+        self.absorb_peer_from(&resp);
+        // 码主已把我们登记为已配对；本机这边对等地补上，两端状态才对称
+        let _ = self.mark_paired(&peer.id, true);
+        let fp = self.security_fingerprints().get(&peer.id).cloned();
+        crate::dbglog::info(format!(
+            "[pair] 已用配对码与 {} 完成配对；安全码 {}（请与对端屏幕上显示的核对一致）",
+            peer.name,
+            fp.clone().unwrap_or_else(|| "（未取得密钥，仍为明文同步）".to_string())
+        ));
+        let mut resp = resp;
+        if let Some(code) = fp {
+            if !resp.is_object() {
+                resp = serde_json::json!({});
+            }
+            resp["fingerprint"] = serde_json::json!(code);
+        }
+        Ok(resp)
+    }
 
     /// 被对方确认配对：把对方标记为已配对。
 
@@ -899,6 +1191,15 @@ impl SyncManager {
 
                 if let Ok(db) = SyncDb::open(&data_dir) {
 
+                    // 淘汰堆积的纯发现行：每轮探活顺手做一次（一条 DELETE，行数量级）。
+                    // 老库里 last_seen_epoch 为 NULL 的行会被算成「很旧」而先删掉——真在
+                    // 场的设备下一条宣告（广播 5s / mDNS 刷新）就会带着 epoch 重新落库。
+                    match db.purge_discovered() {
+                        Ok(0) => {}
+                        Ok(n) => crate::dbglog::info(format!("[probe] 淘汰 {n} 条未配对且已静默的发现行")),
+                        Err(e) => crate::dbglog::error(format!("[probe] purge_discovered failed: {e}")),
+                    }
+
                     if let Ok(devices) = db.get_devices() {
 
                         for d in devices {
@@ -952,7 +1253,7 @@ impl SyncManager {
 
         let cfg = self.get_config();
 
-        if cfg.enabled && cfg.discovery_method == "broadcast" {
+        if cfg.enabled {
 
             set_discovery_active(true);
 
@@ -1013,15 +1314,34 @@ impl SyncManager {
 
 
 
+    /// 台架隔离开关：`AW_SYNC_NO_DISCOVERY` 非空且非 "0" 时，本进程不许起任何发现线程。
+    ///
+    /// 刻意每次调用都重新读环境变量、不加 OnceLock 缓存：测试进程里各用例是并发跑的，
+    /// 谁先触发都会把「关」或「开」的状态固化给后面所有用例。读一次几微秒，起错线程
+    /// 的代价是污染用户真机信任库。
+    fn discovery_forbidden() -> bool {
+        std::env::var_os("AW_SYNC_NO_DISCOVERY")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    }
+
     fn ensure_discovery_threads(&self) {
 
         let cfg = self.get_config();
 
-        if cfg.discovery_method != "broadcast" {
-
+        // 台架隔离：设了 AW_SYNC_NO_DISCOVERY 就一个发现线程都不拉（ announce / listen /
+        // mDNS 全跳）。开发机上跑测试时，假设备（machine-A、mdns-device-B…）一旦开始
+        // 广播，就会被**同一台机上正在运行的真实服务端**收下并永久写进它的信任列表——
+        // 发现即入库，测试污染的是真数据。需要真组播的那条测试自己 #[ignore] 了。
+        if Self::discovery_forbidden() {
+            log::info!("[aw-sync] AW_SYNC_NO_DISCOVERY 已设置：跳过全部发现线程");
             return;
-
         }
+
+        // 默认「mDNS 首选 + UDP 广播兜底」：两条路径的线程都拉起，先把对端报上来的那个
+        // 写库，冲突时由 discovery::record_peer 按来源仲裁（mDNS 新鲜期内广播不得改写
+        // ip/port）。只有显式把 discovery_method 设成 "udp_only" 才关掉 mDNS 用于排障。
+        let mdns_enabled = cfg.discovery_method != "udp_only";
 
         if DISCOVERY_THREADS_STARTED.swap(true, Ordering::SeqCst) {
 
@@ -1074,6 +1394,24 @@ impl SyncManager {
 
             .spawn(move || discovery::listener_loop(db, udp, sid));
 
+        // mDNS（首选路径）：注册本机服务 + 浏览对端服务，同样由 discovery_active 逐轮门控
+
+        if mdns_enabled {
+            let dev = self_device.clone();
+            let data_dir = self.data_dir.clone();
+            let _ = std::thread::Builder::new()
+                .name("aw-sync-mdns-announce".into())
+                .spawn(move || crate::mdns::announce_loop(discovery::SelfInfo {
+                    device: dev,
+                    data_dir,
+                }));
+
+            let db: discovery::SharedDb = Arc::clone(&self.db);
+            let sid = self_device.id.clone();
+            let _ = std::thread::Builder::new()
+                .name("aw-sync-mdns-browse".into())
+                .spawn(move || crate::mdns::browse_loop(db, sid));
+        }
     }
 
 
@@ -1302,6 +1640,11 @@ impl SyncManager {
                 Some(cfg.self_alias.clone())
 
             },
+
+            // 本机信息会出现在 /info 响应与 UDP 广播里（同网段任何人都读得到），
+            // 密钥一律由配对流程在出站前单独附上，这里永远留空。
+            device_secret: None,
+            machine_uid: None,
 
         }
 

@@ -23,12 +23,20 @@ libc = "0.2"
 # 两端统一：Android 走 openssl 交叉编译不可靠（ef16c71 当年为此换的 rustls），
 # 桌面 Windows 的 Schannel/native-tls 并无必要。
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls-webpki-roots"] }
+# 信封加密（B 方案）：全部纯 Rust，Android 交叉编译不需要 C 工具链
+aes-gcm = "0.11"
+hkdf = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
 rocket = { version = "0.5.1", features = ["json"] }
 rocket_cors = "0.6.0"
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+# mDNS/DNS-SD 设备发现（纯 Rust、自带 mio 线程，不引入第二套 async 运行时；
+# 关 default-features 去掉 flume/async 与 log 转发，日志统一走本模块的 dbglog）
+mdns-sd = { version = "0.21.4", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = ["Win32_Networking_WinSock", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Foundation", "Win32_System_Memory"] }
+windows-sys = { version = "0.52", features = ["Win32_Networking_WinSock", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Foundation", "Win32_System_Memory", "Win32_System_Registry"] }
 
 [dev-dependencies]
 tempfile = "3"

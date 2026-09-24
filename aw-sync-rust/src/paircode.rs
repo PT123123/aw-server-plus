@@ -6,8 +6,12 @@ use chrono::{Duration, Utc};
 use crate::models::{Device, PairCode};
 use crate::storage::SyncDb;
 
-/// 配对码长度（4 位数字）
-const CODE_LEN: usize = 4;
+/// 配对码长度（6 位数字）
+///
+/// 从 4 位提到 6 位：配对码是密钥交换期唯一的身份凭据，同网段攻击者在 5 分钟有效期内
+/// 可无限次试 `/api/0/sync/join`（无速率限制）。4 位只有 1e4 种，6 位是 1e6。
+/// 真正的补救是配对后两端比对安全码（见 crypto::fingerprint）。
+const CODE_LEN: usize = 6;
 /// 配对码有效期（分钟）
 const CODE_VALIDITY_MINUTES: i64 = 5;
 
@@ -43,7 +47,10 @@ impl<'a> PairingManager<'a> {
         PairingManager { db }
     }
 
-    /// 生成一个新配对码（6 位、5 分钟内有效）
+    /// 生成一个新配对码（CODE_LEN 位、5 分钟内有效）。
+    ///
+    /// 安全说明：桌面端 aw-server 绑定 0.0.0.0 且 /api/0/sync/log 对同网段任何人可读，
+    /// 所以配对码的具体数字绝不能进日志/同步日志；这里只留「已生成」事件。
     pub fn create_pair_code(&self) -> Result<PairCode, PairError> {
         self.db.cleanup_expired_codes()?;
         let now = Utc::now();
@@ -55,7 +62,8 @@ impl<'a> PairingManager<'a> {
         };
         self.db.store_pair_code(&pc)?;
         crate::dbglog::info(format!(
-            "[pair] 配对码已生成: {} (有效期至 {})", pc.code, pc.expires_at.to_rfc3339()
+            "[pair] 已生成 {} 位配对码（有效期 {} 分钟，数字不入日志）",
+            CODE_LEN, CODE_VALIDITY_MINUTES
         ));
         Ok(pc)
     }
@@ -69,15 +77,19 @@ impl<'a> PairingManager<'a> {
     pub fn join_with_code(&self, code: &str, device: Device) -> Result<Device, PairError> {
         let code = code.trim().to_uppercase();
         crate::dbglog::info(format!(
-            "[pair] 收到加入请求: code={} 设备={}({}) {}:{}",
-            code, device.name, device.id, device.ip, device.port
+            "[pair] 收到加入请求: 设备={}({}) {}:{}",
+            device.name, device.id, device.ip, device.port
         ));
         if !self.db.validate_pair_code(&code)? {
-            crate::dbglog::warn(format!("[pair] 加入被拒绝: 配对码无效或已过期 (code={})", code));
+            crate::dbglog::warn("[pair] 加入被拒绝: 配对码无效或已过期");
             return Err(PairError::InvalidOrExpiredCode);
         }
         let mut device = device;
         device.paired = true; // 配对完成
+        // 报文里那个 is_self 是「对方眼中的自己」，恒为 true —— 原样入库会让这台刚配好的
+        // 设备在码主的列表里被标成本机，前端 `!is_self` 一过滤就整机消失（配了个寂寞）。
+        // 广播路径的同一类缺陷见 discovery::record_peer 的固化。
+        device.is_self = false;
         self.db.upsert_device(&device)?;
         self.db.delete_pair_code(&code)?;
         crate::dbglog::info(format!(
@@ -88,10 +100,11 @@ impl<'a> PairingManager<'a> {
     }
 }
 
-/// 生成 4 位纯数字配对码（0000-9999）
+/// 生成 CODE_LEN 位纯数字配对码
 fn generate_code() -> String {
     let mut rng = rand::thread_rng();
-    format!("{:04}", rng.gen_range(0..10000))
+    let bound: u32 = 10u32.pow(CODE_LEN as u32);
+    format!("{:0width$}", rng.gen_range(0..bound), width = CODE_LEN)
 }
 
 #[cfg(test)]
@@ -134,6 +147,8 @@ mod tests {
             is_self: false,
             paired: false,
             alias: None,
+            device_secret: None,
+            machine_uid: None,
         };
         mgr.join_with_code(&pc.code, device).unwrap();
         assert!(!mgr.validate_code(&pc.code).unwrap());
@@ -160,6 +175,8 @@ mod tests {
             is_self: false,
             paired: false,
             alias: None,
+            device_secret: None,
+            machine_uid: None,
         };
         let res = mgr.join_with_code("BADCODE", device);
         assert!(matches!(res, Err(PairError::InvalidOrExpiredCode)));

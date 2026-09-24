@@ -1,7 +1,7 @@
 //! aw-sync-rust
 //!
 //! ActivityWatch 局域网同步的独立实现库：
-//! 设备发现（UDP 广播 / mDNS，轮询遍历占位）、配对码、目标库序列化传输、
+//! 设备发现（mDNS 首选 + UDP 广播备选，轮询遍历占位）、配对码、目标库序列化传输、
 //! HTTP 同步、冲突处理占位、同步状态持久化、REST API 挂载。
 //!
 //! 通过 aw-server 依赖并挂载进同一个 libaw_server.so，随 APK 打包。
@@ -12,10 +12,13 @@ extern crate log;
 pub mod models;
 pub mod storage;
 pub mod paircode;
+pub mod crypto;
 pub mod serialize;
 pub mod conflict;
 pub mod transport;
 pub mod discovery;
+pub mod mdns;
+pub mod machine_uid;
 pub mod manager;
 pub mod dbglog;
 pub mod endpoints;
@@ -24,6 +27,9 @@ pub mod d1_sync;
 pub use manager::SyncManager;
 /// 由 Android（Java）侧注入 Wi-Fi 链路真实 IP（绕过 VPN 隧道）时使用。
 pub use manager::set_local_ip_override;
+/// 由 Android（Java）侧注入 OS 级装机标识（ANDROID_ID）时使用。
+/// 传的是**原始值 + 平台标签**，派生哈希只有一份实现（Rust）。
+pub use machine_uid::set_raw as set_machine_uid_raw;
 
 /// 同步端口默认值（五位数）
 pub const DEFAULT_SYNC_PORT: u16 = 5600;
