@@ -229,7 +229,7 @@ pub struct CreateTodoPayload {
     pub created_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
 pub struct UpdateTodoPayload {
     pub title: Option<String>,
     pub content: Option<String>,
@@ -286,14 +286,33 @@ pub fn note_history_to_response(h: &NoteHistory) -> NoteHistoryResponse {
 // 一次请求携带多条 create/update/delete/restore；目标可用自增 id 或全局唯一 uuid 指定。
 // 推荐用 uuid：它跨设备唯一，AI 分析后回传的指令不会因 id 冲突而误伤别的条目。
 
-/// 批量操作的动作类型（JSON 里小写：create/update/delete/restore）。
+/// 批量操作的动作类型（JSON 里 snake_case：create/update/delete/restore/add_tags/...）。
+///
+/// 通用：`create` `update`（按提供字段替换）`delete` `restore`
+/// 标签（笔记/任务通用）：`add_tags` `remove_tags` `set_tags`
+/// 笔记专用：`comment`（给笔记追加一条评论）
+/// 任务专用：`set_completed` `move` `set_priority` `set_due` `add_subtask`
+///          `remove_subtask` `set_subtask` `comment`（追加到任务备注）
+///
+/// 增量动作（add_tags/remove_tags/…）让 AI 无需先知道条目的现有字段，直接下指令即可。
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum BatchAction {
     Create,
     Update,
     Delete,
     Restore,
+    AddTags,
+    RemoveTags,
+    SetTags,
+    Comment,
+    SetCompleted,
+    Move,
+    SetPriority,
+    SetDue,
+    AddSubtask,
+    RemoveSubtask,
+    SetSubtask,
 }
 
 impl BatchAction {
@@ -303,6 +322,17 @@ impl BatchAction {
             BatchAction::Update => "update",
             BatchAction::Delete => "delete",
             BatchAction::Restore => "restore",
+            BatchAction::AddTags => "add_tags",
+            BatchAction::RemoveTags => "remove_tags",
+            BatchAction::SetTags => "set_tags",
+            BatchAction::Comment => "comment",
+            BatchAction::SetCompleted => "set_completed",
+            BatchAction::Move => "move",
+            BatchAction::SetPriority => "set_priority",
+            BatchAction::SetDue => "set_due",
+            BatchAction::AddSubtask => "add_subtask",
+            BatchAction::RemoveSubtask => "remove_subtask",
+            BatchAction::SetSubtask => "set_subtask",
         }
     }
 }
@@ -354,6 +384,15 @@ pub struct TodoBatchOp {
     pub subtasks: Option<Vec<TodoSubtaskItem>>,
     #[serde(default)]
     pub list_id: Option<i64>,
+    /// `move` 用：按清单名转移（list_id 缺省时按名称精确匹配；"收集箱" 归 0）
+    #[serde(default)]
+    pub list_name: Option<String>,
+    /// `remove_subtask` / `set_subtask` 用：子任务 id
+    #[serde(default)]
+    pub subtask_id: Option<i64>,
+    /// `set_due` 用：显式清空截止日期（与 due_date 二选一）
+    #[serde(default)]
+    pub clear_due: Option<bool>,
     #[serde(default)]
     pub created_at: Option<DateTime<Utc>>,
 }

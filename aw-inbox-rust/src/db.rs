@@ -1456,7 +1456,61 @@ fn resolve_todo_ref(
     Ok(None)
 }
 
-/// 逐条执行笔记批量指令（create/update/delete/restore）。
+/// 合并标签：把 add 里的标签追加到 base 末尾（去重、忽略空白、保持原顺序）。
+fn merge_tags(base: &[String], add: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = base.to_vec();
+    for t in add {
+        let t = t.trim();
+        if t.is_empty() || out.iter().any(|x| x == t) {
+            continue;
+        }
+        out.push(t.to_string());
+    }
+    out
+}
+
+/// 从 base 中移除 remove 里的标签（精确匹配，不做层级展开）。
+fn subtract_tags(base: &[String], remove: &[String]) -> Vec<String> {
+    let rm: std::collections::HashSet<&str> = remove.iter().map(|s| s.trim()).collect();
+    base.iter().filter(|t| !rm.contains(t.as_str())).cloned().collect()
+}
+
+/// 按清单名解析清单 id：空或「收集箱」→ 0；未找到返回 None。
+fn todo_list_id_by_name_db(conn: &DbConnection, name: &str) -> Result<Option<i64>, Error> {
+    let name = name.trim();
+    if name.is_empty() || name == "收集箱" {
+        return Ok(Some(0));
+    }
+    conn.query_row(
+        "SELECT id FROM todo_lists WHERE name = ?1",
+        params![name],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+}
+
+/// 设置或清空任务截止日期（bump 版本号）；返回更新后的任务。
+fn set_todo_due_db(
+    conn: &mut DbConnection,
+    todo_id: i64,
+    due: Option<DateTime<Utc>>,
+) -> Result<Todo, Error> {
+    let updated_at = Utc::now();
+    let tx = conn.transaction()?;
+    let global_version: i64 = tx.query_row(
+        "UPDATE sync_versions SET global_version = global_version + 1 RETURNING global_version",
+        [],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        "UPDATE todos SET due_date = ?1, updated_at = ?2, version = ?3 WHERE id = ?4",
+        params![due, updated_at, global_version, todo_id],
+    )?;
+    tx.commit()?;
+    get_todo_by_id_db(conn, todo_id)
+}
+
+/// 逐条执行笔记批量指令。
 pub fn batch_notes_db(
     conn: &mut DbConnection,
     payload: NoteBatchPayload,
@@ -1520,6 +1574,51 @@ pub fn batch_notes_db(
                 Ok(None) => Err("需要提供 id 或 uuid 定位笔记".to_string()),
                 Err(e) => Err(e.to_string()),
             },
+            // 标签增量操作：不必先知道现状即可追加/移除/整体替换
+            BatchAction::AddTags | BatchAction::RemoveTags | BatchAction::SetTags => {
+                match resolve_note_ref(conn, op.id, op.uuid.as_deref()) {
+                    Ok(Some((note_id, _))) => match get_note_db(conn, note_id) {
+                        Ok(Some(existing)) => {
+                            let incoming = op.tags.unwrap_or_default();
+                            let tags = match action {
+                                BatchAction::AddTags => merge_tags(&existing.tags, &incoming),
+                                BatchAction::RemoveTags => subtract_tags(&existing.tags, &incoming),
+                                _ => incoming, // SetTags：整体替换
+                            };
+                            let update_payload = UpdateNotePayload {
+                                content: existing.content,
+                                tags: Some(tags),
+                            };
+                            match update_note_db(conn, note_id, update_payload, device_id.clone()) {
+                                Ok(Some(n)) => Ok((Some(n.id), Some(n.uuid))),
+                                Ok(None) => Err("笔记不存在".to_string()),
+                                Err(e) => Err(e.to_string()),
+                            }
+                        }
+                        Ok(None) => Err("笔记不存在".to_string()),
+                        Err(e) => Err(e.to_string()),
+                    },
+                    Ok(None) => Err("需要提供 id 或 uuid 定位笔记".to_string()),
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+            // 给笔记追加一条评论（评论本身就是一条带 Comment 关系的笔记）
+            BatchAction::Comment => match resolve_note_ref(conn, op.id, op.uuid.as_deref()) {
+                Ok(Some((note_id, _))) => {
+                    let comment_payload = CreateCommentPayload {
+                        content: op.content.unwrap_or_default(),
+                        tags: op.tags,
+                    };
+                    match add_comment_db(conn, note_id, comment_payload) {
+                        Ok((comment, _relation)) => Ok((Some(comment.id), Some(comment.uuid))),
+                        Err(Error::QueryReturnedNoRows) => Err("笔记不存在".to_string()),
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+                Ok(None) => Err("需要提供 id 或 uuid 定位笔记".to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+            other => Err(format!("笔记不支持动作 {}", other.as_str())),
         };
 
         match outcome {
@@ -1615,6 +1714,211 @@ pub fn batch_todos_db(
                 Ok(Some((todo_id, _))) => match restore_todo_db(conn, todo_id) {
                     Ok(Some(t)) => Ok((Some(t.id), Some(t.uuid))),
                     Ok(None) => Err("任务不存在或未删除".to_string()),
+                    Err(e) => Err(e.to_string()),
+                },
+                Ok(None) => Err("需要提供 id 或 uuid 定位任务".to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+            // 标签增量操作（追加 / 移除 / 整体替换）
+            BatchAction::AddTags | BatchAction::RemoveTags | BatchAction::SetTags => {
+                match resolve_todo_ref(conn, op.id, op.uuid.as_deref()) {
+                    Ok(Some((todo_id, _))) => match get_todo_by_id_db(conn, todo_id) {
+                        Ok(existing) => {
+                            let incoming = op.tags.unwrap_or_default();
+                            let tags = match action {
+                                BatchAction::AddTags => merge_tags(&existing.tags, &incoming),
+                                BatchAction::RemoveTags => subtract_tags(&existing.tags, &incoming),
+                                _ => incoming,
+                            };
+                            let update_payload =
+                                UpdateTodoPayload { tags: Some(tags), ..Default::default() };
+                            match update_todo_db(conn, todo_id, update_payload) {
+                                Ok(t) => Ok((Some(t.id), Some(t.uuid))),
+                                Err(Error::QueryReturnedNoRows) => Err("任务不存在".to_string()),
+                                Err(e) => Err(e.to_string()),
+                            }
+                        }
+                        Err(e) => Err(e.to_string()),
+                    },
+                    Ok(None) => Err("需要提供 id 或 uuid 定位任务".to_string()),
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+            BatchAction::SetCompleted => match op.completed {
+                Some(completed) => match resolve_todo_ref(conn, op.id, op.uuid.as_deref()) {
+                    Ok(Some((todo_id, _))) => {
+                        let update_payload =
+                            UpdateTodoPayload { completed: Some(completed), ..Default::default() };
+                        match update_todo_db(conn, todo_id, update_payload) {
+                            Ok(t) => Ok((Some(t.id), Some(t.uuid))),
+                            Err(Error::QueryReturnedNoRows) => Err("任务不存在".to_string()),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                    Ok(None) => Err("需要提供 id 或 uuid 定位任务".to_string()),
+                    Err(e) => Err(e.to_string()),
+                },
+                None => Err("set_completed 需要 completed 字段".to_string()),
+            },
+            // 转移清单：list_id 优先，否则按 list_name 精确匹配（收集箱 = 0）
+            BatchAction::Move => match resolve_todo_ref(conn, op.id, op.uuid.as_deref()) {
+                Ok(Some((todo_id, _))) => {
+                    let list_result: Result<Option<i64>, String> = if let Some(id) = op.list_id {
+                        Ok(Some(id))
+                    } else if let Some(name) = op.list_name.as_deref() {
+                        match todo_list_id_by_name_db(conn, name) {
+                            Ok(Some(id)) => Ok(Some(id)),
+                            Ok(None) => Err(format!("清单不存在: {}", name)),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    } else {
+                        Ok(None)
+                    };
+                    match list_result {
+                        Ok(Some(list_id)) => {
+                            let update_payload =
+                                UpdateTodoPayload { list_id: Some(list_id), ..Default::default() };
+                            match update_todo_db(conn, todo_id, update_payload) {
+                                Ok(t) => Ok((Some(t.id), Some(t.uuid))),
+                                Err(Error::QueryReturnedNoRows) => Err("任务不存在".to_string()),
+                                Err(e) => Err(e.to_string()),
+                            }
+                        }
+                        Ok(None) => Err("move 需要 list_id 或 list_name".to_string()),
+                        Err(e) => Err(e),
+                    }
+                }
+                Ok(None) => Err("需要提供 id 或 uuid 定位任务".to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+            BatchAction::SetPriority => match op.priority {
+                Some(priority) => match resolve_todo_ref(conn, op.id, op.uuid.as_deref()) {
+                    Ok(Some((todo_id, _))) => {
+                        let update_payload =
+                            UpdateTodoPayload { priority: Some(priority), ..Default::default() };
+                        match update_todo_db(conn, todo_id, update_payload) {
+                            Ok(t) => Ok((Some(t.id), Some(t.uuid))),
+                            Err(Error::QueryReturnedNoRows) => Err("任务不存在".to_string()),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                    Ok(None) => Err("需要提供 id 或 uuid 定位任务".to_string()),
+                    Err(e) => Err(e.to_string()),
+                },
+                None => Err("set_priority 需要 priority 字段（0 无 / 1 低 / 2 中 / 3 高）".to_string()),
+            },
+            // 截止日期：due_date 设置，clear_due=true 清空
+            BatchAction::SetDue => match resolve_todo_ref(conn, op.id, op.uuid.as_deref()) {
+                Ok(Some((todo_id, _))) => {
+                    if op.clear_due == Some(true) {
+                        match set_todo_due_db(conn, todo_id, None) {
+                            Ok(t) => Ok((Some(t.id), Some(t.uuid))),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    } else if let Some(due) = op.due_date {
+                        match set_todo_due_db(conn, todo_id, Some(due)) {
+                            Ok(t) => Ok((Some(t.id), Some(t.uuid))),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    } else {
+                        Err("set_due 需要 due_date 或 clear_due".to_string())
+                    }
+                }
+                Ok(None) => Err("需要提供 id 或 uuid 定位任务".to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+            // 追加子任务（id 自动取现有最大值 +1）
+            BatchAction::AddSubtask => match resolve_todo_ref(conn, op.id, op.uuid.as_deref()) {
+                Ok(Some((todo_id, _))) => match get_todo_by_id_db(conn, todo_id) {
+                    Ok(existing) => {
+                        let title = op.title.clone().unwrap_or_default();
+                        if title.trim().is_empty() {
+                            Err("add_subtask 需要 title".to_string())
+                        } else {
+                            let mut subs = existing.subtasks.clone();
+                            let next_id = subs.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+                            subs.push(crate::models::TodoSubtaskItem {
+                                id: next_id,
+                                title,
+                                completed: false,
+                            });
+                            let update_payload =
+                                UpdateTodoPayload { subtasks: Some(subs), ..Default::default() };
+                            match update_todo_db(conn, todo_id, update_payload) {
+                                Ok(t) => Ok((Some(t.id), Some(t.uuid))),
+                                Err(e) => Err(e.to_string()),
+                            }
+                        }
+                    }
+                    Err(e) => Err(e.to_string()),
+                },
+                Ok(None) => Err("需要提供 id 或 uuid 定位任务".to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+            BatchAction::RemoveSubtask => match resolve_todo_ref(conn, op.id, op.uuid.as_deref()) {
+                Ok(Some((todo_id, _))) => match (get_todo_by_id_db(conn, todo_id), op.subtask_id) {
+                    (Ok(existing), Some(sub_id)) => {
+                        let subs: Vec<_> =
+                            existing.subtasks.into_iter().filter(|s| s.id != sub_id).collect();
+                        let update_payload =
+                            UpdateTodoPayload { subtasks: Some(subs), ..Default::default() };
+                        match update_todo_db(conn, todo_id, update_payload) {
+                            Ok(t) => Ok((Some(t.id), Some(t.uuid))),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                    (Ok(_), None) => Err("remove_subtask 需要 subtask_id".to_string()),
+                    (Err(e), _) => Err(e.to_string()),
+                },
+                Ok(None) => Err("需要提供 id 或 uuid 定位任务".to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+            // 勾选/取消子任务（completed 缺省按 true）
+            BatchAction::SetSubtask => match resolve_todo_ref(conn, op.id, op.uuid.as_deref()) {
+                Ok(Some((todo_id, _))) => match (get_todo_by_id_db(conn, todo_id), op.subtask_id) {
+                    (Ok(existing), Some(sub_id)) => {
+                        let completed = op.completed.unwrap_or(true);
+                        let mut subs = existing.subtasks.clone();
+                        let mut found = false;
+                        for s in subs.iter_mut() {
+                            if s.id == sub_id {
+                                s.completed = completed;
+                                found = true;
+                            }
+                        }
+                        if !found {
+                            Err(format!("子任务不存在: {}", sub_id))
+                        } else {
+                            let update_payload =
+                                UpdateTodoPayload { subtasks: Some(subs), ..Default::default() };
+                            match update_todo_db(conn, todo_id, update_payload) {
+                                Ok(t) => Ok((Some(t.id), Some(t.uuid))),
+                                Err(e) => Err(e.to_string()),
+                            }
+                        }
+                    }
+                    (Ok(_), None) => Err("set_subtask 需要 subtask_id".to_string()),
+                    (Err(e), _) => Err(e.to_string()),
+                },
+                Ok(None) => Err("需要提供 id 或 uuid 定位任务".to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+            // 给任务追加备注/评论（追加到备注末尾，换行分隔）
+            BatchAction::Comment => match resolve_todo_ref(conn, op.id, op.uuid.as_deref()) {
+                Ok(Some((todo_id, _))) => match get_todo_by_id_db(conn, todo_id) {
+                    Ok(existing) => {
+                        let comment = op.content.unwrap_or_default();
+                        let notes = match existing.content {
+                            Some(prev) if !prev.trim().is_empty() => format!("{}\n{}", prev, comment),
+                            _ => comment,
+                        };
+                        let update_payload =
+                            UpdateTodoPayload { content: Some(notes), ..Default::default() };
+                        match update_todo_db(conn, todo_id, update_payload) {
+                            Ok(t) => Ok((Some(t.id), Some(t.uuid))),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
                     Err(e) => Err(e.to_string()),
                 },
                 Ok(None) => Err("需要提供 id 或 uuid 定位任务".to_string()),
