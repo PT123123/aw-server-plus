@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Note {
     pub id: i64,
+    /// 全局唯一逻辑键（32 位十六进制随机串，跨设备唯一）。批量操作/AI 指令用它唯一定位笔记。
+    #[serde(default)]
+    pub uuid: String,
     pub content: String,
     pub tags: Vec<String>, // <<< Changed from String to Vec<String>
     pub created_at: DateTime<Utc>,
@@ -37,6 +40,7 @@ pub struct UpdateNotePayload {
 #[derive(Serialize, Debug)]
 pub struct NoteResponse {
     pub id: i64,
+    pub uuid: String,
     pub content: String,
     pub tags: Vec<String>,  // API 层面返回 Vec<String>
     pub created_at: String, // ISO 8601 格式字符串
@@ -167,6 +171,9 @@ pub struct UpdateTodoListPayload {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Todo {
     pub id: i64,
+    /// 全局唯一逻辑键（32 位十六进制随机串，跨设备唯一）。批量操作/AI 指令用它唯一定位任务。
+    #[serde(default)]
+    pub uuid: String,
     pub title: String,
     pub content: Option<String>,
     pub completed: bool,
@@ -189,6 +196,7 @@ pub struct Todo {
 #[derive(Serialize, Debug)]
 pub struct TodoResponse {
     pub id: i64,
+    pub uuid: String,
     pub title: String,
     pub content: Option<String>,
     pub completed: bool,
@@ -272,4 +280,106 @@ pub fn note_history_to_response(h: &NoteHistory) -> NoteHistoryResponse {
         updated_at: h.updated_at.to_rfc3339(),
         snapshot_at: h.snapshot_at.to_rfc3339(),
     }
+}
+
+// ── 批量操作（AI 指令）───────────────────────────────────────────
+// 一次请求携带多条 create/update/delete/restore；目标可用自增 id 或全局唯一 uuid 指定。
+// 推荐用 uuid：它跨设备唯一，AI 分析后回传的指令不会因 id 冲突而误伤别的条目。
+
+/// 批量操作的动作类型（JSON 里小写：create/update/delete/restore）。
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum BatchAction {
+    Create,
+    Update,
+    Delete,
+    Restore,
+}
+
+impl BatchAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BatchAction::Create => "create",
+            BatchAction::Update => "update",
+            BatchAction::Delete => "delete",
+            BatchAction::Restore => "restore",
+        }
+    }
+}
+
+/// 笔记批量操作中的单条指令。
+#[derive(Deserialize, Debug)]
+pub struct NoteBatchOp {
+    pub action: BatchAction,
+    #[serde(default)]
+    pub id: Option<i64>,
+    #[serde(default)]
+    pub uuid: Option<String>,
+    // create / update 载荷
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct NoteBatchPayload {
+    pub operations: Vec<NoteBatchOp>,
+}
+
+/// 任务批量操作中的单条指令。
+#[derive(Deserialize, Debug)]
+pub struct TodoBatchOp {
+    pub action: BatchAction,
+    #[serde(default)]
+    pub id: Option<i64>,
+    #[serde(default)]
+    pub uuid: Option<String>,
+    // create / update 载荷（均为可选，缺省时保留原值）
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub completed: Option<bool>,
+    #[serde(default)]
+    pub priority: Option<i64>,
+    #[serde(default)]
+    pub due_date: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub subtasks: Option<Vec<TodoSubtaskItem>>,
+    #[serde(default)]
+    pub list_id: Option<i64>,
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct TodoBatchPayload {
+    pub operations: Vec<TodoBatchOp>,
+}
+
+/// 单条指令的执行结果（按输入顺序一一对应，便于定位失败项）。
+#[derive(Serialize, Debug)]
+pub struct BatchOpResult {
+    pub index: usize,
+    pub action: String,
+    pub ok: bool,
+    /// 命中/新建条目的自增 id（失败时为 None）
+    pub id: Option<i64>,
+    /// 命中/新建条目的全局唯一 uuid（失败时为 None）
+    pub uuid: Option<String>,
+    /// 失败原因（成功时为 None）
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct BatchResponse {
+    pub applied: usize,
+    pub failed: usize,
+    pub results: Vec<BatchOpResult>,
 }

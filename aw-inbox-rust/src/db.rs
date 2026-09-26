@@ -1,7 +1,8 @@
 // src/db.rs
 use crate::models::{
-    CreateCommentPayload, CreateNotePayload, CreateNoteRelationPayload, CreateTodoListPayload,
-    CreateTodoPayload, DetailedTag, Note, NoteRelation, NoteRelationType, TagNode, Todo,
+    BatchAction, BatchOpResult, BatchResponse, CreateCommentPayload, CreateNotePayload,
+    CreateNoteRelationPayload, CreateTodoListPayload, CreateTodoPayload, DetailedTag, Note,
+    NoteBatchPayload, NoteRelation, NoteRelationType, TagNode, Todo, TodoBatchPayload,
     TodoListRecord, UpdateNotePayload, UpdateTodoListPayload, UpdateTodoPayload,
 }; // Updated imports
 use chrono::{DateTime, Utc};
@@ -15,6 +16,47 @@ use std::path::Path;
 // --- 错误处理助手 ---
 fn map_serde_error(e: serde_json::Error) -> Error {
     Error::InvalidParameterName(format!("JSON serialization/deserialization error: {}", e))
+}
+
+// --- 标签过滤助手 ---
+
+/// 转义 LIKE 通配符，配合 `ESCAPE '\'` 使用。
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
+/// 追加层级 tag 前缀匹配条件（段边界）：`项目` 命中 tag `项目` 及 `项目/...` 全部子孙，
+/// 但不命中 `项目2`。tags 列存 JSON 数组文本（元素形如 "tag"），故匹配 `"t"`（整元素）
+/// 或 `"t/`（元素前缀）。`exclude = true` 时取反（反向筛选：排除该标签及其子孙）。
+fn push_tag_clause(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn ToSql>>,
+    tag: &str,
+    exclude: bool,
+) {
+    let escaped = escape_like(tag);
+    if exclude {
+        sql.push_str(" AND NOT (tags LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')");
+    } else {
+        sql.push_str(" AND (tags LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')");
+    }
+    params.push(Box::new(format!("%\"{}\"%", escaped)));
+    params.push(Box::new(format!("%\"{}/%", escaped)));
+}
+
+/// 把 `?` 占位符重编号为 `?1, ?2, ...`（与 get_notes_db 的构建方式一致）。
+fn renumber_placeholders(query: &str) -> String {
+    let mut out = String::with_capacity(query.len() + 8);
+    let mut index = 1;
+    for c in query.chars() {
+        if c == '?' {
+            out.push_str(&format!("?{}", index));
+            index += 1;
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 // --- 数据库连接类型 ---
@@ -286,6 +328,7 @@ fn map_row_to_note(row: &Row) -> Result<Note, Error> {
 
     Ok(Note {
         id: row.get("id")?,
+        uuid: row.get::<_, Option<String>>("uuid")?.unwrap_or_default(),
         content: row.get("content")?,
         tags,
         created_at,
@@ -315,10 +358,11 @@ pub fn create_note_db(
         |row| row.get(0),
     )?;
 
-    tx.execute(
+    let uuid: String = tx.query_row(
         r#"
         INSERT INTO notes (uuid, content, tags, created_at, updated_at, version, device_id, deleted, synced_at)
         VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)
+        RETURNING uuid
         "#,
         params![
             payload.content,
@@ -329,6 +373,7 @@ pub fn create_note_db(
             device_id,
             created_at
         ],
+        |row| row.get(0),
     )?;
 
     let id = tx.last_insert_rowid();
@@ -338,6 +383,7 @@ pub fn create_note_db(
 
     Ok(Note {
         id,
+        uuid,
         content: payload.content,
         tags: parsed_tags,
         created_at,
@@ -351,7 +397,7 @@ pub fn create_note_db(
 
 pub fn get_note_db(conn: &DbConnection, note_id: i64) -> Result<Option<Note>, Error> {
     let mut stmt =
-        conn.prepare("SELECT id, content, tags, created_at, updated_at, version, device_id, deleted, synced_at FROM notes WHERE id = ?1")?;
+        conn.prepare("SELECT id, uuid, content, tags, created_at, updated_at, version, device_id, deleted, synced_at FROM notes WHERE id = ?1")?;
     let result = stmt.query_row(params![note_id], map_row_to_note);
 
     match result {
@@ -366,26 +412,21 @@ pub fn get_notes_db(
     limit: Option<i64>,
     offset: Option<i64>,
     tag: Option<String>,
+    exclude_tags: Vec<String>,
     created_after: Option<DateTime<Utc>>,
     created_before: Option<DateTime<Utc>>,
     search: Option<String>,
     sort_by: Option<String>,
 ) -> Result<Vec<Note>, Error> {
     let mut query_str =
-        "SELECT id, content, tags, created_at, updated_at, version, device_id, deleted, synced_at FROM notes WHERE deleted = 0".to_string();
+        "SELECT id, uuid, content, tags, created_at, updated_at, version, device_id, deleted, synced_at FROM notes WHERE deleted = 0".to_string();
     let mut params_vec: Vec<Box<dyn ToSql>> = Vec::new();
 
     if let Some(t) = tag {
-        // 层级 tag 前缀匹配（段边界）：`项目` 命中 tag `项目` 及 `项目/...` 全部子孙，
-        // 但不命中 `项目2`。tags 列存 JSON 数组文本（元素形如 "tag"），
-        // 故匹配 `"t"`（整元素）或 `"t/`（元素前缀）。LIKE 通配符需转义。
-        let escaped = t
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        query_str.push_str(" AND (tags LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')");
-        params_vec.push(Box::new(format!("%\"{}\"%", escaped)));
-        params_vec.push(Box::new(format!("%\"{}/%", escaped)));
+        push_tag_clause(&mut query_str, &mut params_vec, &t, false);
+    }
+    for t in exclude_tags {
+        push_tag_clause(&mut query_str, &mut params_vec, &t, true);
     }
     if let Some(after) = created_after {
         query_str.push_str(" AND created_at >= ?");
@@ -417,21 +458,11 @@ pub fn get_notes_db(
         query_str.push_str(&format!(" OFFSET {}", o));
     }
 
-    let mut final_query_str = String::new();
-    let mut param_index = 1;
-    for c in query_str.chars() {
-        if c == '?' {
-            final_query_str.push_str(&format!("?{}", param_index));
-            param_index += 1;
-        } else {
-            final_query_str.push(c);
-        }
-    }
+    let final_query_str = renumber_placeholders(&query_str);
 
     let mut stmt = conn.prepare(&final_query_str)?;
     let params_ref: Vec<&dyn ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
 
-    // *** MUST FIX THIS LINE LOCALLY: Remove '¶', use 'params_ref' ***
     let notes_iter = stmt.query_map(&params_ref[..], map_row_to_note)?;
 
     let mut notes = Vec::new();
@@ -789,7 +820,7 @@ pub fn get_comments_for_note_db(
     note_id: i64,
 ) -> Result<Vec<(Note, NoteRelation)>, Error> {
     let mut stmt = conn.prepare(
-        "SELECT n.id, n.content, n.tags, n.created_at, n.updated_at,
+        "SELECT n.id, n.uuid, n.content, n.tags, n.created_at, n.updated_at,
                 n.version, n.device_id, n.deleted, n.synced_at,
                 r.id as relation_id, r.source_note_id, r.target_note_id, r.relation_type, r.created_at as relation_created_at
          FROM notes n
@@ -804,6 +835,7 @@ pub fn get_comments_for_note_db(
 
         let note = Note {
             id: row.get("id")?,
+            uuid: row.get::<_, Option<String>>("uuid")?.unwrap_or_default(),
             content: row.get("content")?,
             tags,
             created_at: row.get("created_at")?,
@@ -923,9 +955,10 @@ pub fn add_comment_db(
         |row| row.get(0),
     )?;
 
-    tx.execute(
-        "INSERT INTO notes (uuid, content, tags, created_at, updated_at, version, device_id, deleted, synced_at) VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, 0, ?)",
+    let comment_uuid: String = tx.query_row(
+        "INSERT INTO notes (uuid, content, tags, created_at, updated_at, version, device_id, deleted, synced_at) VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, 0, ?) RETURNING uuid",
         params![payload.content, tags_json, created_at, updated_at, global_version, Option::<String>::None, created_at],
+        |row| row.get(0),
     )?;
 
     let comment_note_id = tx.last_insert_rowid();
@@ -945,6 +978,7 @@ pub fn add_comment_db(
     Ok((
         Note {
             id: comment_note_id,
+            uuid: comment_uuid,
             content: payload.content,
             tags,
             created_at,
@@ -979,6 +1013,7 @@ fn map_row_to_todo(row: &rusqlite::Row) -> Result<Todo, Error> {
 
     Ok(Todo {
         id: row.get("id")?,
+        uuid: row.get::<_, Option<String>>("uuid")?.unwrap_or_default(),
         title: row.get("title")?,
         content: row.get("content")?,
         completed: completed != 0,
@@ -1017,11 +1052,12 @@ pub fn create_todo_db(
         |row| row.get(0),
     )?;
 
-    tx.execute(
+    let uuid: String = tx.query_row(
         r#"
         INSERT INTO todos (uuid, title, content, completed, priority, due_date, tags, subtasks, list_id,
                            created_at, updated_at, completed_at, version, device_id, deleted, synced_at)
         VALUES (lower(hex(randomblob(16))), ?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, 0, ?12)
+        RETURNING uuid
         "#,
         params![
             payload.title,
@@ -1037,6 +1073,7 @@ pub fn create_todo_db(
             device_id,
             created_at,
         ],
+        |row| row.get(0),
     )?;
 
     let id = tx.last_insert_rowid();
@@ -1048,6 +1085,7 @@ pub fn create_todo_db(
 
     Ok(Todo {
         id,
+        uuid,
         title: payload.title,
         content: payload.content,
         completed: false,
@@ -1069,16 +1107,25 @@ pub fn create_todo_db(
 pub fn get_todos_db(
     conn: &DbConnection,
     completed: Option<bool>,
+    tag: Option<String>,
+    exclude_tags: Vec<String>,
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<Vec<Todo>, Error> {
     let mut sql = String::from(
-        "SELECT id, title, content, completed, priority, due_date, tags, subtasks, list_id,
+        "SELECT id, uuid, title, content, completed, priority, due_date, tags, subtasks, list_id,
                 created_at, updated_at, completed_at, version, device_id, deleted, synced_at
          FROM todos WHERE deleted = 0",
     );
+    let mut params_vec: Vec<Box<dyn ToSql>> = Vec::new();
     if let Some(c) = completed {
         sql.push_str(&format!(" AND completed = {}", if c { 1 } else { 0 }));
+    }
+    if let Some(t) = tag {
+        push_tag_clause(&mut sql, &mut params_vec, &t, false);
+    }
+    for t in exclude_tags {
+        push_tag_clause(&mut sql, &mut params_vec, &t, true);
     }
     sql.push_str(" ORDER BY completed ASC, priority DESC NULLS LAST, created_at DESC");
     if let Some(l) = limit {
@@ -1088,8 +1135,10 @@ pub fn get_todos_db(
         sql.push_str(&format!(" OFFSET {}", o));
     }
 
-    let mut stmt = conn.prepare(&sql)?;
-    let todos_iter = stmt.query_map([], map_row_to_todo)?;
+    let final_sql = renumber_placeholders(&sql);
+    let mut stmt = conn.prepare(&final_sql)?;
+    let params_ref: Vec<&dyn ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+    let todos_iter = stmt.query_map(&params_ref[..], map_row_to_todo)?;
     let mut todos = Vec::new();
     for todo_result in todos_iter {
         todos.push(todo_result?);
@@ -1099,7 +1148,7 @@ pub fn get_todos_db(
 
 pub fn get_todo_by_id_db(conn: &DbConnection, todo_id: i64) -> Result<Todo, Error> {
     let todo = conn.query_row(
-        "SELECT id, title, content, completed, priority, due_date, tags, subtasks, list_id,
+        "SELECT id, uuid, title, content, completed, priority, due_date, tags, subtasks, list_id,
                 created_at, updated_at, completed_at, version, device_id, deleted, synced_at
          FROM todos WHERE id = ?1",
         params![todo_id],
@@ -1172,6 +1221,7 @@ pub fn update_todo_db(
 
     Ok(Todo {
         id: todo_id,
+        uuid: existing.uuid,
         title,
         content,
         completed,
@@ -1346,4 +1396,257 @@ pub fn delete_todo_list_db(conn: &mut DbConnection, list_id: i64) -> Result<bool
     let rows = tx.execute("DELETE FROM todo_lists WHERE id = ?1", params![list_id])?;
     tx.commit()?;
     Ok(rows > 0)
+}
+
+// ── 批量操作（给 AI 返回的操作指令用）───────────────────────────
+// 每条指令独立执行、互不影响（不整体回滚），逐条返回成功/失败，便于定位问题项。
+
+/// 按 uuid（优先，跨设备唯一）或自增 id 定位一条笔记，返回 (id, uuid)。
+fn resolve_note_ref(
+    conn: &DbConnection,
+    id: Option<i64>,
+    uuid: Option<&str>,
+) -> Result<Option<(i64, String)>, Error> {
+    let row = |id: i64| -> Result<(i64, String), Error> {
+        conn.query_row(
+            "SELECT id, uuid FROM notes WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default())),
+        )
+    };
+    if let Some(u) = uuid.filter(|u| !u.trim().is_empty()) {
+        return conn
+            .query_row(
+                "SELECT id, uuid FROM notes WHERE uuid = ?1",
+                params![u],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default())),
+            )
+            .optional();
+    }
+    if let Some(id) = id {
+        return row(id).optional();
+    }
+    Ok(None)
+}
+
+/// 按 uuid（优先）或自增 id 定位一条任务，返回 (id, uuid)。
+fn resolve_todo_ref(
+    conn: &DbConnection,
+    id: Option<i64>,
+    uuid: Option<&str>,
+) -> Result<Option<(i64, String)>, Error> {
+    if let Some(u) = uuid.filter(|u| !u.trim().is_empty()) {
+        return conn
+            .query_row(
+                "SELECT id, uuid FROM todos WHERE uuid = ?1",
+                params![u],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default())),
+            )
+            .optional();
+    }
+    if let Some(id) = id {
+        return conn
+            .query_row(
+                "SELECT id, uuid FROM todos WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default())),
+            )
+            .optional();
+    }
+    Ok(None)
+}
+
+/// 逐条执行笔记批量指令（create/update/delete/restore）。
+pub fn batch_notes_db(
+    conn: &mut DbConnection,
+    payload: NoteBatchPayload,
+    device_id: Option<String>,
+) -> Result<BatchResponse, Error> {
+    let mut results: Vec<BatchOpResult> = Vec::with_capacity(payload.operations.len());
+    let mut applied = 0usize;
+    let mut failed = 0usize;
+
+    for (index, op) in payload.operations.into_iter().enumerate() {
+        let action = op.action;
+        let outcome: Result<(Option<i64>, Option<String>), String> = match action {
+            BatchAction::Create => {
+                let create_payload = CreateNotePayload {
+                    content: op.content.unwrap_or_default(),
+                    tags: op.tags,
+                    created_at: op.created_at,
+                };
+                create_note_db(conn, create_payload, device_id.clone())
+                    .map(|n| (Some(n.id), Some(n.uuid)))
+                    .map_err(|e| e.to_string())
+            }
+            BatchAction::Update => match resolve_note_ref(conn, op.id, op.uuid.as_deref()) {
+                Ok(Some((note_id, _))) => match get_note_db(conn, note_id) {
+                    Ok(Some(existing)) => {
+                        let update_payload = UpdateNotePayload {
+                            content: op.content.unwrap_or(existing.content),
+                            tags: op.tags.or(Some(existing.tags)),
+                        };
+                        match update_note_db(conn, note_id, update_payload, device_id.clone()) {
+                            Ok(Some(n)) => Ok((Some(n.id), Some(n.uuid))),
+                            Ok(None) => Err("笔记不存在".to_string()),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                    Ok(None) => Err("笔记不存在".to_string()),
+                    Err(e) => Err(e.to_string()),
+                },
+                Ok(None) => Err("需要提供 id 或 uuid 定位笔记".to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+            BatchAction::Delete => match resolve_note_ref(conn, op.id, op.uuid.as_deref()) {
+                Ok(Some((note_id, note_uuid))) => {
+                    match delete_note_db(conn, note_id, device_id.clone()) {
+                        Ok(true) => Ok((Some(note_id), Some(note_uuid))),
+                        Ok(false) => Err("笔记不存在或已删除".to_string()),
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+                Ok(None) => Err("需要提供 id 或 uuid 定位笔记".to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+            BatchAction::Restore => match resolve_note_ref(conn, op.id, op.uuid.as_deref()) {
+                Ok(Some((note_id, _))) => {
+                    match restore_note_db(conn, note_id, device_id.clone()) {
+                        Ok(Some(n)) => Ok((Some(n.id), Some(n.uuid))),
+                        Ok(None) => Err("笔记不存在或未删除".to_string()),
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+                Ok(None) => Err("需要提供 id 或 uuid 定位笔记".to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+        };
+
+        match outcome {
+            Ok((id, uuid)) => {
+                applied += 1;
+                results.push(BatchOpResult {
+                    index,
+                    action: action.as_str().to_string(),
+                    ok: true,
+                    id,
+                    uuid,
+                    error: None,
+                });
+            }
+            Err(err) => {
+                failed += 1;
+                results.push(BatchOpResult {
+                    index,
+                    action: action.as_str().to_string(),
+                    ok: false,
+                    id: None,
+                    uuid: None,
+                    error: Some(err),
+                });
+            }
+        }
+    }
+
+    Ok(BatchResponse { applied, failed, results })
+}
+
+/// 逐条执行任务批量指令（create/update/delete/restore）。
+pub fn batch_todos_db(
+    conn: &mut DbConnection,
+    payload: TodoBatchPayload,
+    device_id: Option<String>,
+) -> Result<BatchResponse, Error> {
+    let mut results: Vec<BatchOpResult> = Vec::with_capacity(payload.operations.len());
+    let mut applied = 0usize;
+    let mut failed = 0usize;
+
+    for (index, op) in payload.operations.into_iter().enumerate() {
+        let action = op.action;
+        let outcome: Result<(Option<i64>, Option<String>), String> = match action {
+            BatchAction::Create => match op.title.clone() {
+                Some(title) => {
+                    let create_payload = CreateTodoPayload {
+                        title,
+                        content: op.content.clone(),
+                        priority: op.priority,
+                        due_date: op.due_date,
+                        tags: op.tags.clone(),
+                        subtasks: op.subtasks.clone(),
+                        list_id: op.list_id,
+                        created_at: op.created_at,
+                    };
+                    create_todo_db(conn, create_payload, device_id.clone())
+                        .map(|t| (Some(t.id), Some(t.uuid)))
+                        .map_err(|e| e.to_string())
+                }
+                None => Err("创建任务需要 title".to_string()),
+            },
+            BatchAction::Update => match resolve_todo_ref(conn, op.id, op.uuid.as_deref()) {
+                Ok(Some((todo_id, _))) => {
+                    let update_payload = UpdateTodoPayload {
+                        title: op.title,
+                        content: op.content,
+                        completed: op.completed,
+                        priority: op.priority,
+                        due_date: op.due_date,
+                        tags: op.tags,
+                        subtasks: op.subtasks,
+                        list_id: op.list_id,
+                    };
+                    match update_todo_db(conn, todo_id, update_payload) {
+                        Ok(t) => Ok((Some(t.id), Some(t.uuid))),
+                        Err(Error::QueryReturnedNoRows) => Err("任务不存在".to_string()),
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+                Ok(None) => Err("需要提供 id 或 uuid 定位任务".to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+            BatchAction::Delete => match resolve_todo_ref(conn, op.id, op.uuid.as_deref()) {
+                Ok(Some((todo_id, todo_uuid))) => match delete_todo_db(conn, todo_id) {
+                    Ok(()) => Ok((Some(todo_id), Some(todo_uuid))),
+                    Err(e) => Err(e.to_string()),
+                },
+                Ok(None) => Err("需要提供 id 或 uuid 定位任务".to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+            BatchAction::Restore => match resolve_todo_ref(conn, op.id, op.uuid.as_deref()) {
+                Ok(Some((todo_id, _))) => match restore_todo_db(conn, todo_id) {
+                    Ok(Some(t)) => Ok((Some(t.id), Some(t.uuid))),
+                    Ok(None) => Err("任务不存在或未删除".to_string()),
+                    Err(e) => Err(e.to_string()),
+                },
+                Ok(None) => Err("需要提供 id 或 uuid 定位任务".to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+        };
+
+        match outcome {
+            Ok((id, uuid)) => {
+                applied += 1;
+                results.push(BatchOpResult {
+                    index,
+                    action: action.as_str().to_string(),
+                    ok: true,
+                    id,
+                    uuid,
+                    error: None,
+                });
+            }
+            Err(err) => {
+                failed += 1;
+                results.push(BatchOpResult {
+                    index,
+                    action: action.as_str().to_string(),
+                    ok: false,
+                    id: None,
+                    uuid: None,
+                    error: Some(err),
+                });
+            }
+        }
+    }
+
+    Ok(BatchResponse { applied, failed, results })
 }

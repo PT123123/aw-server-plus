@@ -27,10 +27,11 @@ pub mod db;
 pub mod models;
 // Ensure models.rs has correct Note/NoteResponse definitions (tags: Vec<String>)
 use crate::models::{
-    CreateCommentPayload, CreateNotePayload, CreateNoteRelationPayload, CreateTodoListPayload,
-    CreateTodoPayload, DetailedTag, Note, NoteHistoryResponse, NoteRelation, NoteResponse,
-    TagTreeResponse, Todo, TodoListRecord, TodoListResponse, TodoResponse, UpdateNotePayload,
-    UpdateTodoListPayload, UpdateTodoPayload, note_history_to_response,
+    BatchResponse, CreateCommentPayload, CreateNotePayload, CreateNoteRelationPayload,
+    CreateTodoListPayload, CreateTodoPayload, DetailedTag, Note, NoteBatchPayload,
+    NoteHistoryResponse, NoteRelation, NoteResponse, TagTreeResponse, Todo, TodoBatchPayload,
+    TodoListRecord, TodoListResponse, TodoResponse, UpdateNotePayload, UpdateTodoListPayload,
+    UpdateTodoPayload, note_history_to_response,
 };
 
 // --- Use correct DbConnection type ---
@@ -41,6 +42,7 @@ pub struct SharedTodoDb(pub Arc<Mutex<db::DbConnection>>);
 fn note_to_response(note: &Note) -> NoteResponse {
     NoteResponse {
         id: note.id,
+        uuid: note.uuid.clone(),
         content: note.content.clone(),
         tags: note.tags.clone(),
         created_at: note.created_at.to_rfc3339(),
@@ -269,6 +271,7 @@ pub fn mount_rocket(rocket: Rocket<Build>, db: SharedDb, todo_db: SharedTodoDb) 
             root,
             create_note,
             get_notes,
+            batch_notes,
             get_note,
             update_note,
             delete_note,
@@ -290,6 +293,7 @@ pub fn mount_rocket(rocket: Rocket<Build>, db: SharedDb, todo_db: SharedTodoDb) 
             update_todo,
             delete_todo,
             restore_todo,
+            batch_todos,
             // Todo 清单路由
             get_todo_lists,
             create_todo_list,
@@ -348,6 +352,9 @@ struct NotesQuery {
     limit: Option<i64>,
     offset: Option<i64>,
     tag: Option<String>,
+    /// 反向筛选：排除这些标签（及其 `tag/...` 子孙）的笔记。
+    /// 支持重复出现：`?exclude_tag=a&exclude_tag=b`。
+    exclude_tag: Vec<String>,
     search: Option<String>,
     sort_by: Option<String>,
 }
@@ -363,12 +370,14 @@ async fn get_notes(
     let limit = query.limit;
     let offset = query.offset;
     let tag = query.tag;
+    let exclude_tag = query.exclude_tag;
     let search = query.search;
     let sort_by = query.sort_by;
 
     let notes = task::spawn_blocking(move || {
         let conn = db_arc.lock().map_err(|_| Status::InternalServerError)?;
-        db::get_notes_db(&conn, limit, offset, tag, None, None, search, sort_by).map_err(handle_db_error)
+        db::get_notes_db(&conn, limit, offset, tag, exclude_tag, None, None, search, sort_by)
+            .map_err(handle_db_error)
     })
     .await
     .map_err(handle_spawn_error)??; // Double '?'
@@ -461,6 +470,28 @@ async fn restore_note(
     }
 }
 
+// 批量操作笔记：一次请求执行多条 create/update/delete/restore 指令（供 AI 回传的操作指令使用）。
+// 每条指令用 id 或全局唯一 uuid 定位；逐条返回结果，单条失败不影响其余指令。
+#[post("/notes/batch", data = "<payload>", format = "json")]
+async fn batch_notes(
+    db_state: &State<SharedDb>,
+    payload: Json<NoteBatchPayload>,
+    device_id_guard: DeviceIdGuard,
+) -> Result<Json<BatchResponse>, Status> {
+    let db_arc = db_state.inner().clone();
+    let batch_payload = payload.into_inner();
+    let device_id_str = device_id_guard.0;
+
+    let response = task::spawn_blocking(move || {
+        let mut conn_guard = db_arc.lock().map_err(|_| Status::InternalServerError)?;
+        db::batch_notes_db(&mut conn_guard, batch_payload, device_id_str).map_err(handle_db_error)
+    })
+    .await
+    .map_err(handle_spawn_error)??;
+
+    Ok(Json(response))
+}
+
 // 修改migrate_db函数，解决借用问题
 pub async fn migrate_db(db_path: &str) -> Result<(), Status> {
     // 复制路径字符串，以便在闭包中使用
@@ -491,6 +522,7 @@ pub async fn migrate_db(db_path: &str) -> Result<(), Status> {
 fn todo_to_response(todo: &Todo) -> TodoResponse {
     TodoResponse {
         id: todo.id,
+        uuid: todo.uuid.clone(),
         title: todo.title.clone(),
         content: todo.content.clone(),
         completed: todo.completed,
@@ -513,6 +545,10 @@ fn todo_to_response(todo: &Todo) -> TodoResponse {
 #[derive(FromForm)]
 struct TodoQuery {
     completed: Option<bool>,
+    tag: Option<String>,
+    /// 反向筛选：排除这些标签（及其 `tag/...` 子孙）的任务。
+    /// 支持重复出现：`?exclude_tag=a&exclude_tag=b`。
+    exclude_tag: Vec<String>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
@@ -523,9 +559,16 @@ async fn get_todos(
     query: TodoQuery,
 ) -> Result<Json<Vec<TodoResponse>>, Status> {
     let db_arc = db_state.inner().0.clone();
+    let (completed, tag, exclude_tag, limit, offset) = (
+        query.completed,
+        query.tag,
+        query.exclude_tag,
+        query.limit,
+        query.offset,
+    );
     let todos = task::spawn_blocking(move || {
         let db = db_arc.lock().map_err(|_| Status::InternalServerError)?;
-        db::get_todos_db(&db, query.completed, query.limit, query.offset).map_err(handle_db_error)
+        db::get_todos_db(&db, completed, tag, exclude_tag, limit, offset).map_err(handle_db_error)
     })
     .await
     .map_err(handle_spawn_error)??;
@@ -617,6 +660,27 @@ async fn restore_todo(
         Some(t) => Ok(Json(todo_to_response(&t))),
         None => Err(Status::NotFound),
     }
+}
+
+// 批量操作任务：一次请求执行多条 create/update/delete/restore 指令（供 AI 回传的操作指令使用）。
+#[post("/todos/batch", data = "<payload>", format = "json")]
+async fn batch_todos(
+    db_state: &State<SharedTodoDb>,
+    payload: Json<TodoBatchPayload>,
+    device: DeviceIdGuard,
+) -> Result<Json<BatchResponse>, Status> {
+    let db_arc = db_state.inner().0.clone();
+    let batch_payload = payload.into_inner();
+    let device_id = device.0;
+
+    let response = task::spawn_blocking(move || {
+        let mut db = db_arc.lock().map_err(|_| Status::InternalServerError)?;
+        db::batch_todos_db(&mut db, batch_payload, device_id).map_err(handle_db_error)
+    })
+    .await
+    .map_err(handle_spawn_error)??;
+
+    Ok(Json(response))
 }
 
 // ── Todo list handlers（清单，与 tag 独立） ─────────────────────
